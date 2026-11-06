@@ -1,0 +1,60 @@
+[package]
+name = "bamboo-player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+biquad = "0.6.0"
+blake3 = "1.8.7"
+chardetng = "1.0.0"
+chrono = "0.4.45"
+cpal = "0.18.2"
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+ebur128 = "0.1.11"
+eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "persistence", "default_fonts"] }
+egui = "0.35"
+egui-phosphor = "0.13"
+egui-wgpu = "0.35"
+encoding_rs = "0.8.44"
+fontdb = "0.24.0"
+fuzzy-matcher = "0.3.7"
+global-hotkey = "0.9.0"
+image = { version = "0.25.10", features = ["jpeg", "png", "webp"] }
+lofty = "0.25.5"
+memmap2 = "0.9.12"
+muda = "0.21.2"
+parking_lot = "0.12.5"
+rand = "0.10.3"
+raw-window-handle = "0.6"
+rayon = "1.12.0"
+rfd = "0.17.2"
+rtrb = "0.4.1"
+rubato = "5.0.1"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+symphonia = { version = "0.6.1", features = ["mp3", "vorbis", "wav", "flac", "aac", "isomp4", "ogg", "pcm", "alac", "id3v2"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.26.1"
+ureq = { version = "3.5.1", features = ["native-tls", "json", "cookies", "win-system-proxy"] }
+url = "2.5.8"
+walkdir = "2.5.0"
+webbrowser = "1.2.6"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Media_Audio", "Foundation", "Foundation_Collections", "Media", "Storage_Streams", "Graphics_Imaging", "UI_Notifications", "Win32_Security", "Win32_System_ProcessStatus", "Win32_System_Memory"] }
+
+[dev-dependencies]
+hound = "3.5.1"
+pretty_assertions = "1.4.1"
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

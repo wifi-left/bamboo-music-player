@@ -1,0 +1,4 @@
+/target
+/shot*.png
+*.log
+*.tmp

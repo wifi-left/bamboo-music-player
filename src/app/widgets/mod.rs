@@ -141,12 +141,12 @@ pub struct SeekResult {
 
 pub fn seek_bar(
     ui: &mut Ui,
+    width: f32,
     position: f32,
     duration: f32,
     colors: &ThemeColors,
     enabled: bool,
 ) -> Option<SeekResult> {
-    let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, 18.0), Sense::click_and_drag());
     let hovered = response.hovered();
     let t = if duration > 0.0 {

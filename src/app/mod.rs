@@ -19,6 +19,7 @@ use crate::i18n::t;
 use crate::model::{Page, Track, TrackSource, normalize_path};
 use crate::platform::tray::{Tray, TrayAction};
 use crate::platform::window;
+use crate::library::{BrowseService, FolderBrowser, ScanEvent, ScanService};
 use crate::playlist::Queue;
 use crate::util::metadata::{self, LocalMeta, MetadataService};
 use crate::util::{format_time, is_audio_file, open_in_explorer};
@@ -38,6 +39,13 @@ pub struct Toast {
     pub text: String,
     pub kind: ToastKind,
     pub created: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResumeIntent {
+    pub key: String,
+    pub position: f64,
+    pub was_playing: bool,
 }
 
 pub struct App {
@@ -80,6 +88,24 @@ pub struct App {
     pub settings_scroll_to: Option<&'static str>,
     pub memory_info: Option<crate::platform::memory::MemoryInfo>,
     pub last_memory_sample: Instant,
+    pub last_trim: Instant,
+    pub gpu_info: String,
+    pub style_reapplied: bool,
+    pub style_reapply_at: Instant,
+    pub was_focused: bool,
+    pub scan: ScanService,
+    pub scan_id: u64,
+    pub scan_active: bool,
+    pub scan_found: usize,
+    pub scan_current: String,
+    pub scan_play_first: bool,
+    pub scan_played_first: bool,
+    pub scan_added: usize,
+    pub scan_started: Instant,
+    pub browser: FolderBrowser,
+    pub browse: BrowseService,
+    pub current_playlist: Option<PathBuf>,
+    pub resume_after_import: Option<ResumeIntent>,
 }
 
 impl App {
@@ -111,16 +137,32 @@ impl App {
         let engine = AudioEngine::new(settings.playback.volume, settings.playback.muted);
         let device_info = engine.output_info();
         let lang = settings.language;
+        let gpu_info = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| {
+                let info = state.adapter.get_info();
+                format!("{} · {:?}", info.name, info.backend)
+            })
+            .unwrap_or_else(|| "未知渲染后端".to_string());
 
         let mut queue = Queue {
             items: session.queue.clone(),
-            current: session
-                .current_index
-                .filter(|i| *i < session.queue.len()),
+            current: None,
             shuffle: session.shuffle,
             repeat: session.repeat,
             ..Default::default()
         };
+        queue.rebuild_keys();
+        queue.current = session
+            .current_key
+            .as_ref()
+            .and_then(|key| queue.position_of_key(key))
+            .or_else(|| {
+                session
+                    .current_index
+                    .filter(|i| *i < session.queue.len())
+            });
         if queue.shuffle {
             queue.build_shuffle_order(true);
         }
@@ -136,6 +178,7 @@ impl App {
             settings.theme.font_family.clone(),
             settings.theme.font_size.round() as u8,
         );
+        let current_playlist = session.playlist_path.clone();
 
         let mut app = Self {
             settings,
@@ -177,19 +220,45 @@ impl App {
             settings_scroll_to: None,
             memory_info: crate::platform::memory::process_memory(),
             last_memory_sample: Instant::now(),
+            last_trim: Instant::now(),
+            gpu_info,
+            style_reapplied: false,
+            style_reapply_at: Instant::now() + Duration::from_millis(450),
+            was_focused: true,
+            scan: ScanService::new(),
+            scan_id: 0,
+            scan_active: false,
+            scan_found: 0,
+            scan_current: String::new(),
+            scan_play_first: false,
+            scan_played_first: false,
+            scan_added: 0,
+            scan_started: Instant::now(),
+            browser: FolderBrowser::default(),
+            browse: BrowseService::new(),
+            current_playlist,
+            resume_after_import: None,
         };
 
         app.page = page;
         app.restore_notice_pending = app.session.saved_at.is_some() && !app.queue.is_empty();
 
         if let Some(index) = app.queue.current {
-            let start = if app.settings.playback.resume_on_start {
-                app.session.position_secs.max(0.0)
-            } else {
-                0.0
-            };
+            // Restore the position even when paused; the setting only controls
+            // whether playback starts automatically.
+            let start = app.session.position_secs.max(0.0);
             let autoplay = app.settings.playback.resume_on_start;
             app.load_index(index, start, autoplay);
+        }
+
+        if app.settings.playlist.auto_refresh_on_startup {
+            if let Some(playlist) = app.current_playlist.clone() {
+                if playlist.is_file() {
+                    app.import_playlist(playlist, true);
+                } else {
+                    app.current_playlist = None;
+                }
+            }
         }
 
         let args = app.startup_args.clone();
@@ -458,6 +527,8 @@ impl App {
         self.background = None;
         self.cover_key.clear();
         self.playback_state = PlaybackState::Stopped;
+        self.current_playlist = None;
+        self.resume_after_import = None;
         self.session_dirty = true;
         self.update_title();
     }
@@ -485,70 +556,411 @@ impl App {
     }
 
     pub fn add_paths(&mut self, paths: Vec<PathBuf>, play_first: bool) {
-        let was_empty = self.queue.is_empty();
         let extensions = self.settings.library.extensions.clone();
-        let mut audio_files: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut playlists: Vec<PathBuf> = Vec::new();
         let mut skipped = 0usize;
 
         for path in paths {
             if path.is_dir() {
-                for entry in walkdir::WalkDir::new(&path)
-                    .follow_links(self.settings.library.follow_symlinks)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                {
-                    let p = entry.path();
-                    if entry.file_type().is_file() && is_audio_file(p, &extensions) {
-                        audio_files.push(p.to_path_buf());
-                    }
-                }
+                dirs.push(path);
             } else if is_audio_file(&path, &extensions) {
-                audio_files.push(path);
+                files.push(path);
             } else if path.is_file() {
                 let ext = path
                     .extension()
                     .map(|e| e.to_string_lossy().to_ascii_lowercase())
                     .unwrap_or_default();
-                if ext == "mp3list" || ext == "m3u" || ext == "m3u8" {
-                    skipped += 1;
+                if matches!(ext.as_str(), "mp3list" | "m3u" | "m3u8") {
+                    playlists.push(path);
                 } else {
                     skipped += 1;
                 }
             }
         }
 
-        audio_files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
-        audio_files.dedup_by(|a, b| normalize_path(a) == normalize_path(b));
-
-        let mut added = 0usize;
-        let mut first_added: Option<usize> = None;
-        for path in audio_files {
-            let before = self.queue.len();
-            let track = Track::local(path.clone());
-            let key = track.dedupe_key();
-            if self.queue.add(track) {
-                added += 1;
-                self.metadata.request(path);
-                if first_added.is_none() {
-                    first_added = Some(before);
-                }
-                let _ = key;
-            }
+        if let Some(playlist) = playlists.into_iter().next() {
+            self.import_playlist(playlist, true);
+            return;
         }
 
+        let mut added = 0usize;
+        if !files.is_empty() {
+            added += self.add_audio_files(files, play_first);
+        }
+        let had_dirs = !dirs.is_empty();
+        if had_dirs {
+            self.start_scan(dirs, play_first);
+        }
         if added > 0 {
             self.toast(
                 format!("{}: {}", self.t("toast.files_added"), added),
                 ToastKind::Success,
             );
-            self.session_dirty = true;
-        } else if skipped > 0 {
+        } else if !had_dirs && skipped > 0 {
             self.toast("没有找到可播放的音频文件（歌单导入将在下一阶段启用）", ToastKind::Info);
         }
+    }
 
-        if play_first || (was_empty && self.queue.current.is_none()) {
+    fn add_audio_files(&mut self, mut files: Vec<PathBuf>, play_first: bool) -> usize {
+        files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+        files.dedup_by(|a, b| normalize_path(a) == normalize_path(b));
+        let mut added = 0usize;
+        let mut first_added: Option<usize> = None;
+        for path in files {
+            let before = self.queue.len();
+            if self.queue.add(Track::local(path.clone())) {
+                added += 1;
+                self.metadata.request(path);
+                if first_added.is_none() {
+                    first_added = Some(before);
+                }
+            }
+        }
+        self.session_dirty |= added > 0;
+        if play_first || (self.queue.current.is_none() && added > 0) {
             if let Some(index) = first_added.or(self.queue.current) {
                 self.load_index(index, 0.0, true);
+            }
+        }
+        added
+    }
+
+    /// Recursively scans directories on a worker thread and streams the queue
+    /// in batches. This is the path used for very large trees.
+    pub fn start_scan(&mut self, roots: Vec<PathBuf>, play_first: bool) {
+        if roots.is_empty() {
+            return;
+        }
+        self.scan.cancel();
+        self.scan_id = self.scan.start(
+            roots,
+            self.settings.library.extensions.clone(),
+            self.settings.library.follow_symlinks,
+        );
+        self.scan_active = true;
+        self.scan_found = 0;
+        self.scan_added = 0;
+        self.scan_current.clear();
+        self.scan_play_first = play_first;
+        self.scan_played_first = false;
+        self.scan_started = Instant::now();
+        self.toast("正在后台扫描目录…", ToastKind::Info);
+    }
+
+    pub fn cancel_scan(&mut self) {
+        self.scan.cancel();
+        self.scan_active = false;
+        self.scan_id = 0;
+        self.scan_current.clear();
+    }
+
+    fn poll_scan(&mut self) {
+        // At most two 500-file batches per frame keep queue insertion smooth.
+        let mut batches = 0;
+        while batches < 2 {
+            let Some(event) = self.scan.try_recv() else {
+                break;
+            };
+            match event {
+                ScanEvent::Progress {
+                    id,
+                    found,
+                    current,
+                } if id == self.scan_id => {
+                    self.scan_found = found;
+                    self.scan_current = current;
+                    self.ctx.request_repaint();
+                }
+                ScanEvent::Batch { id, paths } if id == self.scan_id => {
+                    batches += 1;
+                    let mut first_new = None;
+                    for path in paths {
+                        let before = self.queue.len();
+                        if self.queue.add(Track::local(path.clone())) {
+                            self.scan_added += 1;
+                            self.metadata.request(path);
+                            if first_new.is_none() {
+                                first_new = Some(before);
+                            }
+                        }
+                    }
+                    if self.scan_play_first && !self.scan_played_first {
+                        if let Some(index) = first_new
+                            .or(self.queue.current)
+                            .or_else(|| (!self.queue.is_empty()).then_some(0))
+                        {
+                            self.load_index(index, 0.0, true);
+                            self.scan_played_first = true;
+                        }
+                    }
+                    self.session_dirty = true;
+                    self.try_resume_after_import();
+                }
+                ScanEvent::Finished {
+                    id,
+                    total,
+                    cancelled,
+                    elapsed_ms,
+                } if id == self.scan_id => {
+                    tracing::info!(
+                        "scan finished: total={total} cancelled={cancelled} elapsed={elapsed_ms}ms"
+                    );
+                    self.scan_active = false;
+                    self.scan_current.clear();
+                    if cancelled {
+                        self.toast(
+                            format!("扫描已取消，已加入 {} 首", self.scan_added),
+                            ToastKind::Info,
+                        );
+                    } else if total == 0 {
+                        self.toast("没有找到可播放的音频文件", ToastKind::Info);
+                    } else {
+                        self.toast(
+                            format!(
+                                "扫描完成：{} 首（{} 秒）",
+                                total,
+                                (elapsed_ms / 1000).max(1)
+                            ),
+                            ToastKind::Success,
+                        );
+                    }
+                    self.try_resume_after_import();
+                }
+                ScanEvent::Error { id, message } if id == self.scan_id => {
+                    self.toast(message, ToastKind::Error);
+                }
+                _ => {}
+            }
+        }
+        if self.scan_active {
+            self.ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    pub fn browse_folder_dialog(&mut self) {
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            if !self.settings.library.folders.iter().any(|f| f == &folder) {
+                self.settings.library.folders.push(folder.clone());
+                self.settings_dirty = true;
+            }
+            self.open_browser(folder);
+        }
+    }
+
+    pub fn open_browser(&mut self, path: PathBuf) {
+        self.browser.current = Some(path.clone());
+        self.browser.loading = true;
+        self.browser.error = None;
+        self.browser.entries.clear();
+        self.browser.truncated = false;
+        self.browse
+            .request(path, self.settings.library.extensions.clone());
+        self.ctx.request_repaint();
+    }
+
+    pub fn browser_up(&mut self) {
+        let Some(current) = self.browser.current.clone() else {
+            return;
+        };
+        if let Some(parent) = current.parent() {
+            self.open_browser(parent.to_path_buf());
+        }
+    }
+
+    fn poll_browser(&mut self) {
+        for result in self.browse.poll() {
+            if self.browser.current.as_ref() == Some(&result.path) {
+                self.browser.entries = result.entries;
+                self.browser.error = result.error;
+                self.browser.truncated = result.truncated;
+                self.browser.loading = false;
+                self.ctx.request_repaint();
+            }
+        }
+    }
+
+    pub fn play_browser_file(&mut self, path: PathBuf) {
+        let key = Track::local(path.clone()).dedupe_key();
+        if let Some(index) = self.queue.position_of_key(&key) {
+            self.load_index(index, 0.0, true);
+            return;
+        }
+        let before = self.queue.len();
+        if self.queue.add(Track::local(path.clone())) {
+            self.metadata.request(path);
+            self.session_dirty = true;
+            self.load_index(before, 0.0, true);
+        }
+    }
+
+    pub fn import_playlist_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Bamboo Playlist", &["mp3list"])
+            .add_filter("M3U", &["m3u", "m3u8"])
+            .pick_file()
+        {
+            self.import_playlist(path, true);
+        }
+    }
+
+    pub fn export_playlist_dialog(&mut self) {
+        if self.queue.is_empty() {
+            self.toast("当前队列为空", ToastKind::Info);
+            return;
+        }
+        let default_name = self
+            .current_playlist
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "playlist.mp3list".to_string());
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Bamboo Playlist", &["mp3list"])
+            .set_file_name(default_name)
+            .save_file()
+        {
+            match crate::playlist::mp3list::export(
+                &path,
+                &self.queue.items,
+                self.settings.playlist.export_utf8_bom,
+            ) {
+                Ok(count) => self.toast(
+                    format!("{}: {} 首", self.t("toast.exported"), count),
+                    ToastKind::Success,
+                ),
+                Err(err) => self.toast(err, ToastKind::Error),
+            }
+        }
+    }
+
+    pub fn rescan_current_playlist(&mut self) {
+        if let Some(path) = self.current_playlist.clone() {
+            self.import_playlist(path, true);
+        }
+    }
+
+    /// Re-reads a `.mp3list` and re-expands every `#SEARCH#` directory. The
+    /// current track and position are captured first and matched by path key
+    /// after the new queue has been built, so added/removed files do not shift
+    /// the resume point.
+    pub fn import_playlist(&mut self, path: PathBuf, replace: bool) {
+        let parsed = match crate::playlist::mp3list::parse(&path) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.toast(err, ToastKind::Error);
+                return;
+            }
+        };
+
+        tracing::info!(
+            "playlist {}: {} dirs, {} files, {} urls, {} online, {} missing ({})",
+            path.display(),
+            parsed.dirs.len(),
+            parsed.files.len(),
+            parsed.urls.len(),
+            parsed.online.len(),
+            parsed.missing,
+            parsed.encoding
+        );
+        let intent = if replace {
+            self.current_track.as_ref().map(|track| ResumeIntent {
+                key: track.dedupe_key(),
+                position: self.engine.position_secs(),
+                was_playing: self.is_playing(),
+            })
+        } else {
+            None
+        };
+
+        if replace {
+            self.engine.stop();
+            self.scan.cancel();
+            self.scan_active = false;
+            self.scan_id = 0;
+            self.queue.clear();
+            self.current_track = None;
+            self.current_duration = None;
+            self.cover = None;
+            self.background = None;
+            self.cover_key.clear();
+            self.playback_state = PlaybackState::Stopped;
+            self.resume_after_import = intent;
+            self.current_playlist = Some(path.clone());
+        }
+
+        let added = self.add_imported_entries(&parsed);
+        if !parsed.dirs.is_empty() {
+            self.start_scan(parsed.dirs.clone(), false);
+        }
+        self.try_resume_after_import();
+
+        if self.queue.is_empty() && !self.scan_active {
+            self.toast("歌单为空或文件已全部失效", ToastKind::Error);
+        } else {
+            let missing = if parsed.missing > 0 {
+                format!("，{} 个文件不存在", parsed.missing)
+            } else {
+                String::new()
+            };
+            self.toast(
+                format!("已导入 {} 首{missing} · {}", added, parsed.encoding),
+                ToastKind::Success,
+            );
+        }
+        self.session_dirty = true;
+        self.update_title();
+    }
+
+    fn add_imported_entries(
+        &mut self,
+        parsed: &crate::playlist::mp3list::ParsedPlaylist,
+    ) -> usize {
+        let mut added = 0usize;
+        for path in &parsed.files {
+            if self.queue.add(Track::local(path.clone())) {
+                added += 1;
+                self.metadata.request(path.clone());
+            }
+        }
+        for url in &parsed.urls {
+            let track = Track {
+                source: TrackSource::Url { url: url.clone() },
+                title: url.clone(),
+                source_name: "在线".to_string(),
+                ..Default::default()
+            };
+            if self.queue.add(track) {
+                added += 1;
+            }
+        }
+        for track in &parsed.online {
+            if self.queue.add(track.clone()) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    fn try_resume_after_import(&mut self) {
+        let Some(intent) = self.resume_after_import.clone() else {
+            return;
+        };
+        if let Some(index) = self.queue.position_of_key(&intent.key) {
+            self.resume_after_import = None;
+            tracing::info!(
+                "resume {} at {:.2}s (autoplay={})",
+                intent.key,
+                intent.position,
+                intent.was_playing
+            );
+            self.load_index(index, intent.position, intent.was_playing);
+            self.toast("已恢复上次的曲目与播放位置", ToastKind::Info);
+        } else if !self.scan_active {
+            self.resume_after_import = None;
+            if !self.queue.is_empty() {
+                self.toast("上次播放的曲目已不在新歌单中", ToastKind::Info);
             }
         }
     }
@@ -598,6 +1010,7 @@ impl App {
                 }
                 cover_bytes = meta.cover;
             }
+            updated.apply_filename_fallback();
             if cover_bytes.is_none() {
                 if let Some(sidecar) = metadata::sidecar_cover_path(path) {
                     cover_bytes = std::fs::read(sidecar).ok();
@@ -653,34 +1066,42 @@ impl App {
     }
 
     fn poll_metadata(&mut self) {
-        let updates = self.metadata.poll();
+        // Bounded batches keep the frame time predictable even when a scan
+        // enqueues thousands of tag reads.
+        let updates = self.metadata.poll_batch(100);
         if updates.is_empty() {
             return;
         }
         let current_key = self.current_track.as_ref().map(|t| t.dedupe_key());
+        let mut index = std::collections::HashMap::with_capacity(self.queue.items.len());
+        for (i, track) in self.queue.items.iter().enumerate() {
+            index.insert(track.dedupe_key(), i);
+        }
         let mut refresh_current = false;
         for (key, meta) in updates {
-            if let Some(track) = self.queue.items.iter_mut().find(|t| t.dedupe_key() == key) {
+            let Some(&position) = index.get(&key) else {
+                continue;
+            };
+            let updated = {
+                let track = &mut self.queue.items[position];
                 apply_meta(track, &meta);
                 if track.duration.is_none() {
                     track.duration = meta.duration;
                 }
-            }
+                track.clone()
+            };
             if current_key.as_deref() == Some(key.as_str()) {
-                if let Some(track) = self.queue.items.iter().find(|t| t.dedupe_key() == key) {
-                    self.current_track = Some(track.clone());
-                    if self.current_duration.is_none() {
-                        self.current_duration = track.duration;
-                    }
+                if self.current_duration.is_none() {
+                    self.current_duration = updated.duration;
                 }
+                self.current_track = Some(updated);
                 refresh_current = true;
             }
         }
         if refresh_current && self.cover_key.is_empty() {
             self.refresh_visuals();
         }
-        // Metadata improves list rows even without a cover reload.
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_after(Duration::from_millis(33));
     }
 
     // ------------------------------------------------------------------
@@ -825,13 +1246,30 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.window_hidden = false;
+        self.reapply_window_style();
         self.ctx.request_repaint();
+    }
+
+    fn reapply_window_style(&mut self) {
+        if let Some(raw) = self.hwnd {
+            window::apply_style(
+                raw,
+                theme::is_dark(&self.ctx, &self.settings),
+                self.settings.theme.roundness,
+                self.settings.window.capture_protection,
+            );
+        }
     }
 
     pub fn hide_window(&mut self, ctx: &Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.window_hidden = true;
         self.save_now();
+        if self.settings.window.trim_working_set_on_idle {
+            crate::platform::memory::trim_working_set();
+            self.memory_info = crate::platform::memory::process_memory();
+            self.last_trim = Instant::now();
+        }
     }
 
     fn handle_close_request(&mut self, ctx: &Context) {
@@ -983,6 +1421,8 @@ impl App {
             window_maximized: self.window_maximized,
             desktop_lyrics_pos: self.session.desktop_lyrics_pos,
             desktop_lyrics_monitor: self.session.desktop_lyrics_monitor,
+            current_key: self.current_track.as_ref().map(|t| t.dedupe_key()),
+            playlist_path: self.current_playlist.clone(),
             saved_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
         }
     }
@@ -1012,18 +1452,23 @@ impl App {
 
     fn update_window_rect(&mut self, ctx: &Context) {
         let info = ctx.input(|i| i.viewport().clone());
-        if let Some(rect) = info.outer_rect {
-            if rect.width() > 200.0 && rect.height() > 100.0 {
-                self.last_window_rect = Some((
-                    rect.min.x,
-                    rect.min.y,
-                    rect.width(),
-                    rect.height(),
-                ));
-            }
-        }
         if let Some(max) = info.maximized {
             self.window_maximized = max;
+        }
+        if self.window_maximized {
+            // Keep the last restored size; a maximized inner rect must not be
+            // persisted as the windowed size.
+            return;
+        }
+        let Some(outer) = info.outer_rect else {
+            return;
+        };
+        let size = info
+            .inner_rect
+            .map(|r| r.size())
+            .unwrap_or_else(|| outer.size());
+        if size.x > 400.0 && size.y > 300.0 {
+            self.last_window_rect = Some((outer.min.x, outer.min.y, size.x, size.y));
         }
     }
 
@@ -1037,14 +1482,7 @@ impl App {
             fonts::install(&self.ctx, &self.settings);
             self.last_font_config = font_config;
         }
-        if let Some(raw) = self.hwnd {
-            window::apply_style(
-                raw,
-                theme::is_dark(&self.ctx, &self.settings),
-                self.settings.theme.roundness,
-                self.settings.window.capture_protection,
-            );
-        }
+        self.reapply_window_style();
         self.cover_key.clear();
         self.refresh_visuals();
         self.settings_dirty = true;
@@ -1091,35 +1529,76 @@ impl App {
 
     fn player_bar(&mut self, ui: &mut egui::Ui) {
         let colors = self.colors();
-        let compact = ui.available_width() < 1000.0;
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            // Left: now playing cover + titles.
-            ui.allocate_ui_with_layout(
-                vec2(if compact { 210.0 } else { 290.0 }, 64.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let (rect, response) = ui.allocate_exact_size(vec2(54.0, 54.0), egui::Sense::click());
-                    if let Some(cover) = &self.cover {
-                        ui.painter().image(
-                            cover.id(),
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                    } else {
-                        ui.painter()
-                            .rect_filled(rect, egui::CornerRadius::same(8), colors.card);
-                        ui.painter().text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            egui_phosphor::regular::MUSIC_NOTES,
-                            egui::FontId::proportional(22.0),
-                            colors.text_faint,
-                        );
-                    }
-                    ui.add_space(10.0);
-                    ui.vertical(|ui| {
+        let bar = ui.available_rect_before_wrap();
+        let top_h = 68.0;
+        let gap_v = 4.0;
+        let bottom_h = 24.0;
+        let content_h = top_h + gap_v + bottom_h;
+        let y0 = bar.top() + ((bar.height() - content_h) * 0.5).max(0.0);
+        let top_rect = egui::Rect::from_min_size(
+            egui::pos2(bar.left(), y0),
+            egui::vec2(bar.width(), top_h),
+        );
+        let bottom_rect = egui::Rect::from_min_size(
+            egui::pos2(bar.left(), y0 + top_h + gap_v),
+            egui::vec2(bar.width(), bottom_h),
+        );
+
+        // Strict three-column geometry: equal side columns keep the transport
+        // group centered in the window regardless of the text lengths.
+        let total_w = bar.width();
+        let hgap = 10.0;
+        let side_w = ((total_w - 240.0 - hgap * 2.0) * 0.5).clamp(150.0, 300.0);
+        let side_w = side_w.min(((total_w - hgap * 2.0 - 120.0) * 0.5).max(120.0));
+        let left_rect = egui::Rect::from_min_size(top_rect.min, egui::vec2(side_w, top_h));
+        let right_rect = egui::Rect::from_min_size(
+            egui::pos2(top_rect.right() - side_w, top_rect.top()),
+            egui::vec2(side_w, top_h),
+        );
+        let center_rect = egui::Rect::from_min_max(
+            egui::pos2(left_rect.right() + hgap, top_rect.top()),
+            egui::pos2(right_rect.left() - hgap, top_rect.bottom()),
+        );
+
+        // Left: cover + single-line truncated title/artist.
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(left_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let cover_side = 54.0;
+                let (cover_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(cover_side, cover_side),
+                    egui::Sense::hover(),
+                );
+                if let Some(cover) = &self.cover {
+                    ui.painter().image(
+                        cover.id(),
+                        cover_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    ui.painter().rect_filled(
+                        cover_rect,
+                        egui::CornerRadius::same(9),
+                        colors.card,
+                    );
+                    ui.painter().text(
+                        cover_rect.center(),
+                        Align2::CENTER_CENTER,
+                        egui_phosphor::regular::MUSIC_NOTES,
+                        egui::FontId::proportional(22.0),
+                        colors.text_faint,
+                    );
+                }
+                let text_w = (left_rect.width() - cover_side - 10.0).max(40.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_w, 48.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.add_space(5.0);
                         let title = self
                             .current_track
                             .as_ref()
@@ -1130,217 +1609,265 @@ impl App {
                             .as_ref()
                             .map(|t| t.display_artist())
                             .unwrap_or_default();
-                        ui.label(
-                            RichText::new(crate::util::truncate_chars(&title, 26))
-                                .size(14.0)
-                                .strong()
-                                .color(colors.text),
-                        );
-                        ui.label(
-                            RichText::new(crate::util::truncate_chars(&artist, 30))
-                                .size(11.5)
-                                .color(colors.text_weak),
-                        );
-                    });
-                    if response.clicked() {
-                        self.set_page(Page::NowPlaying);
-                    }
-                },
-            );
-
-            // Middle: transport + progress.
-            let middle_width = (ui.available_width() - if compact { 190.0 } else { 260.0 }).max(260.0);
-            ui.allocate_ui_with_layout(
-                vec2(middle_width, 64.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    ui.horizontal(|ui| {
-                        let shuffle_active = self.queue.shuffle;
-                        if widgets::icon_button(
-                            ui,
-                            egui_phosphor::regular::SHUFFLE,
-                            18.0,
-                            self.t("player.shuffle"),
-                            shuffle_active,
-                            true,
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.toggle_shuffle();
-                        }
-                        if widgets::icon_button(
-                            ui,
-                            egui_phosphor::regular::SKIP_BACK,
-                            20.0,
-                            self.t("player.prev"),
-                            false,
-                            !self.queue.is_empty(),
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.prev_track();
-                        }
-                        if play_button(
-                            ui,
-                            self.is_playing(),
-                            self.current_track.is_some() || !self.queue.is_empty(),
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.toggle_play();
-                        }
-                        if widgets::icon_button(
-                            ui,
-                            egui_phosphor::regular::SKIP_FORWARD,
-                            20.0,
-                            self.t("player.next"),
-                            false,
-                            !self.queue.is_empty(),
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.next_track();
-                        }
-                        let repeat_icon = match self.queue.repeat {
-                            crate::model::RepeatMode::One => egui_phosphor::regular::REPEAT_ONCE,
-                            _ => egui_phosphor::regular::REPEAT,
-                        };
-                        if widgets::icon_button(
-                            ui,
-                            repeat_icon,
-                            18.0,
-                            self.queue.repeat.label(),
-                            self.queue.repeat != crate::model::RepeatMode::Off,
-                            true,
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.cycle_repeat();
-                        }
-                    });
-                    let duration = self.duration_secs() as f32;
-                    let position = self.position_secs() as f32;
-                    let seek = widgets::seek_bar(
-                        ui,
-                        position,
-                        duration,
-                        &colors,
-                        self.current_track.is_some(),
-                    );
-                    if let Some(result) = seek {
-                        if let Some(v) = result.value {
-                            self.seek_preview = Some(v as f64);
-                        }
-                        if result.commit {
-                            let target = result
-                                .value
-                                .map(|v| v as f64)
-                                .or(self.seek_preview)
-                                .unwrap_or(position as f64);
-                            self.seek_to(target);
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format_time(self.position_secs()))
-                                .size(11.0)
-                                .color(colors.text_weak),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_w, 19.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                ui.label(
-                                    RichText::new(format_time(duration as f64))
-                                        .size(11.0)
-                                        .color(colors.text_weak),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(title)
+                                            .size(13.5)
+                                            .strong()
+                                            .color(colors.text),
+                                    )
+                                    .truncate()
+                                    .halign(egui::Align::LEFT),
                                 );
                             },
                         );
-                    });
-                },
-            );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_w, 16.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(artist)
+                                            .size(11.0)
+                                            .color(colors.text_weak),
+                                    )
+                                    .truncate()
+                                    .halign(egui::Align::LEFT),
+                                );
+                            },
+                        );
+                    },
+                );
+            },
+        );
+        if ui
+            .interact(
+                left_rect,
+                ui.id().with("bamboo-player-left"),
+                egui::Sense::click(),
+            )
+            .clicked()
+        {
+            self.set_page(Page::NowPlaying);
+        }
 
-            // Right: volume and toggles.
-            ui.allocate_ui_with_layout(
-                vec2(if compact { 180.0 } else { 250.0 }, 64.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if widgets::icon_button(
+        // Middle: transport controls. The group width is fixed by the button
+        // sizes, and the group rect is centered on the bar's center point.
+        const CONTROLS_W: f32 = 34.0 + 36.0 + 46.0 + 36.0 + 34.0 + 4.0 * 6.0;
+        let controls_rect = egui::Rect::from_center_size(
+            egui::pos2(bar.center().x, center_rect.center().y),
+            egui::vec2(CONTROLS_W, 46.0),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(controls_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if widgets::icon_button(
+                    ui,
+                    egui_phosphor::regular::SHUFFLE,
+                    18.0,
+                    self.t("player.shuffle"),
+                    self.queue.shuffle,
+                    true,
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.toggle_shuffle();
+                }
+                if widgets::icon_button(
+                    ui,
+                    egui_phosphor::regular::SKIP_BACK,
+                    20.0,
+                    self.t("player.prev"),
+                    false,
+                    !self.queue.is_empty(),
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.prev_track();
+                }
+                if play_button(
+                    ui,
+                    self.is_playing(),
+                    self.current_track.is_some() || !self.queue.is_empty(),
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.toggle_play();
+                }
+                if widgets::icon_button(
+                    ui,
+                    egui_phosphor::regular::SKIP_FORWARD,
+                    20.0,
+                    self.t("player.next"),
+                    false,
+                    !self.queue.is_empty(),
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.next_track();
+                }
+                let repeat_icon = match self.queue.repeat {
+                    crate::model::RepeatMode::One => egui_phosphor::regular::REPEAT_ONCE,
+                    _ => egui_phosphor::regular::REPEAT,
+                };
+                if widgets::icon_button(
+                    ui,
+                    repeat_icon,
+                    18.0,
+                    self.queue.repeat.label(),
+                    self.queue.repeat != crate::model::RepeatMode::Off,
+                    true,
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.cycle_repeat();
+                }
+            },
+        );
+
+        // Right: volume and utilities, right-aligned with a computed slider width.
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(right_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if widgets::icon_button(
+                    ui,
+                    egui_phosphor::regular::QUEUE,
+                    18.0,
+                    self.t("player.queue"),
+                    self.page == Page::Playlists,
+                    true,
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.set_page(Page::Playlists);
+                }
+                if widgets::icon_button(
+                    ui,
+                    egui_phosphor::regular::TEXT_ALIGN_LEFT,
+                    18.0,
+                    self.t("player.lyrics"),
+                    self.show_lyrics_sidebar,
+                    true,
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.toggle_lyrics_sidebar();
+                }
+                if right_rect.width() >= 280.0
+                    && widgets::icon_button(
                         ui,
-                        egui_phosphor::regular::QUEUE,
+                        egui_phosphor::regular::MONITOR_PLAY,
                         18.0,
-                        self.t("player.queue"),
-                        self.page == Page::Playlists,
+                        self.t("player.desktop_lyrics"),
+                        self.settings.desktop_lyrics.visible_at_start,
                         true,
                         &colors,
                     )
                     .clicked()
-                    {
-                        self.set_page(Page::Playlists);
+                {
+                    self.toggle_desktop_lyrics();
+                }
+                let speaker = if self.settings.playback.muted || self.volume() <= 0.001 {
+                    egui_phosphor::regular::SPEAKER_SLASH
+                } else {
+                    egui_phosphor::regular::SPEAKER_HIGH
+                };
+                if widgets::icon_button(
+                    ui,
+                    speaker,
+                    18.0,
+                    self.t("player.mute"),
+                    false,
+                    true,
+                    &colors,
+                )
+                .clicked()
+                {
+                    self.toggle_mute();
+                }
+                let available = ui.available_width().max(20.0);
+                let volume_w = (available - 4.0).clamp(30.0, 100.0).min(available);
+                if let Some(v) =
+                    widgets::volume_bar(ui, self.volume(), &colors, volume_w)
+                {
+                    self.set_volume(v);
+                }
+            },
+        );
+
+        // Bottom: full-width timeline with fixed-width time labels.
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(bottom_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let time_w = 42.0;
+                let seek_w = (bottom_rect.width() - time_w * 2.0 - 16.0).max(40.0);
+                let duration = self.duration_secs() as f32;
+                let position = self.position_secs() as f32;
+
+                let (left_time, _) = ui.allocate_exact_size(
+                    egui::vec2(time_w, bottom_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().text(
+                    left_time.left_center(),
+                    Align2::LEFT_CENTER,
+                    format_time(self.position_secs()),
+                    egui::FontId::proportional(10.5),
+                    colors.text_weak,
+                );
+                if let Some(result) = widgets::seek_bar(
+                    ui,
+                    seek_w,
+                    position,
+                    duration,
+                    &colors,
+                    self.current_track.is_some(),
+                ) {
+                    if let Some(v) = result.value {
+                        self.seek_preview = Some(v as f64);
                     }
-                    if !compact {
-                        if widgets::icon_button(
-                            ui,
-                            egui_phosphor::regular::MONITOR_PLAY,
-                            18.0,
-                            self.t("player.desktop_lyrics"),
-                            self.settings.desktop_lyrics.visible_at_start,
-                            true,
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.toggle_desktop_lyrics();
-                        }
-                        if widgets::icon_button(
-                            ui,
-                            egui_phosphor::regular::TEXT_ALIGN_LEFT,
-                            18.0,
-                            self.t("player.lyrics"),
-                            self.show_lyrics_sidebar,
-                            true,
-                            &colors,
-                        )
-                        .clicked()
-                        {
-                            self.toggle_lyrics_sidebar();
-                        }
+                    if result.commit {
+                        let target = result
+                            .value
+                            .map(|v| v as f64)
+                            .or(self.seek_preview)
+                            .unwrap_or(position as f64);
+                        self.seek_to(target);
                     }
-                    let speaker = if self.settings.playback.muted || self.volume() <= 0.001 {
-                        egui_phosphor::regular::SPEAKER_SLASH
-                    } else {
-                        egui_phosphor::regular::SPEAKER_HIGH
-                    };
-                    if widgets::icon_button(
-                        ui,
-                        speaker,
-                        18.0,
-                        self.t("player.mute"),
-                        false,
-                        true,
-                        &colors,
-                    )
-                    .clicked()
-                    {
-                        self.toggle_mute();
-                    }
-                    if let Some(v) = widgets::volume_bar(
-                        ui,
-                        self.volume(),
-                        &colors,
-                        if compact { 70.0 } else { 90.0 },
-                    ) {
-                        self.set_volume(v);
-                    }
-                },
-            );
-        });
-        ui.add_space(8.0);
+                }
+                let (right_time, _) = ui.allocate_exact_size(
+                    egui::vec2(time_w, bottom_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().text(
+                    right_time.right_center(),
+                    Align2::RIGHT_CENTER,
+                    format_time(duration as f64),
+                    egui::FontId::proportional(10.5),
+                    colors.text_weak,
+                );
+            },
+        );
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -1495,14 +2022,48 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.handle_engine_events();
         self.poll_metadata();
+        self.poll_scan();
+        self.poll_browser();
         self.handle_tray(ctx);
         self.handle_close_request(ctx);
         self.handle_shortcuts(ctx);
         self.maybe_autosave(ctx);
 
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if !self.style_reapplied && Instant::now() >= self.style_reapply_at {
+            self.reapply_window_style();
+            self.style_reapplied = true;
+        }
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            if focused {
+                self.reapply_window_style();
+            }
+        }
+
         if self.last_memory_sample.elapsed() > Duration::from_secs(2) {
             self.memory_info = crate::platform::memory::process_memory();
             self.last_memory_sample = Instant::now();
+        }
+        if self.settings.window.trim_working_set_on_idle && !self.is_playing() {
+            let viewport = ctx.input(|i| i.viewport().clone());
+            let focused = viewport.focused.unwrap_or(true);
+            let minimized = viewport.minimized.unwrap_or(false);
+            let occluded = viewport.occluded.unwrap_or(false);
+            let wait = if self.window_hidden || minimized {
+                5
+            } else if occluded || !focused {
+                20
+            } else {
+                120
+            };
+            if self.last_trim.elapsed() > Duration::from_secs(wait) {
+                crate::platform::memory::trim_working_set();
+                self.memory_info = crate::platform::memory::process_memory();
+                self.last_trim = Instant::now();
+            }
+        } else if self.is_playing() {
+            self.last_trim = Instant::now();
         }
 
         if self.restore_notice_pending {
@@ -1550,7 +2111,7 @@ impl eframe::App for App {
             .stroke(egui::Stroke::new(1.0, colors.line))
             .inner_margin(egui::Margin::symmetric(16, 0));
         egui::Panel::bottom("bamboo-player-bar")
-            .exact_size(92.0)
+            .exact_size(104.0)
             .frame(bar_frame)
             .show_inside(ui, |ui| self.player_bar(ui));
 
@@ -1594,6 +2155,15 @@ impl eframe::App for App {
 }
 
 pub fn app_icon(accent: [u8; 3]) -> egui::IconData {
+    if let Some((rgba, width, height)) =
+        crate::util::icon::decode_ico(crate::util::icon::APP_ICON_ICO)
+    {
+        return egui::IconData {
+            rgba,
+            width,
+            height,
+        };
+    }
     const SIZE: usize = 64;
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     let cx = (SIZE as f32 - 1.0) / 2.0;

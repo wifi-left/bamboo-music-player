@@ -216,6 +216,9 @@ fn map_menu(id: &str) -> Option<TrayAction> {
 }
 
 fn make_icon(accent: [u8; 3]) -> anyhow::Result<Icon> {
+    if let Some((rgba, width, height)) = crate::util::icon::tray_icon_rgba(32) {
+        return Ok(Icon::from_rgba(rgba, width, height)?);
+    }
     const SIZE: usize = 32;
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     let cx = (SIZE as f32 - 1.0) / 2.0;

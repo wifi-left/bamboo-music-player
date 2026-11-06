@@ -1,5 +1,6 @@
 //! Small shared helpers.
 
+pub mod icon;
 pub mod image_util;
 pub mod metadata;
 

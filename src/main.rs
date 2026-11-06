@@ -4,6 +4,7 @@ mod app;
 mod audio;
 mod config;
 mod i18n;
+mod library;
 mod lyrics;
 mod model;
 mod platform;
@@ -39,25 +40,64 @@ fn main() -> eframe::Result {
         .map(PathBuf::from)
         .filter(|p| p.exists())
         .collect();
+    tracing::info!("startup args: {:?}", startup_args);
     let accent = settings.theme.accent;
 
-    let (width, height) = session.window_size.unwrap_or((1180.0, 760.0));
+    // Restore a sane inner size. Older builds persisted the outer rect, which
+    // could grow every launch and overlap the taskbar; clamp it now.
+    let default_size = (1024.0f32, 680.0f32);
+    let (mut width, mut height) = match session.window_size {
+        Some((w, h))
+            if w.is_finite()
+                && h.is_finite()
+                && w >= 900.0
+                && h >= 560.0
+                && w <= 1280.0
+                && h <= 820.0 =>
+        {
+            (w, h)
+        }
+        _ => default_size,
+    };
+
+    let mut position = session.window_pos;
+    if let Some((wx, wy, ww, wh)) = platform::window::work_area_logical() {
+        let max_w = (ww - 40.0).max(900.0);
+        let max_h = (wh - 80.0).max(560.0);
+        width = width.min(max_w);
+        height = height.min(max_h);
+        if let Some((mut x, mut y)) = position {
+            x = x.clamp(wx + 8.0, (wx + ww - width - 8.0).max(wx + 8.0));
+            y = y.clamp(wy + 8.0, (wy + wh - height - 8.0).max(wy + 8.0));
+            position = Some((x, y));
+        }
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Bamboo Music Player")
         .with_app_id("bamboo-player")
-        .with_inner_size([width.max(900.0), height.max(600.0)])
-        .with_min_inner_size([900.0, 600.0])
+        .with_inner_size([width, height])
+        .with_min_inner_size([900.0, 560.0])
         .with_icon(Arc::new(app::app_icon(accent)));
-    if let Some((x, y)) = session.window_pos {
+    let has_position = position.is_some();
+    if let Some((x, y)) = position {
         viewport = viewport.with_position([x, y]);
     }
 
     let mut wgpu_options = eframe::WgpuConfiguration::default();
     wgpu_options.surface = eframe::SurfaceConfig::LOW_LATENCY;
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(mut setup) = wgpu_options.wgpu_setup {
-        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12
-            | eframe::wgpu::Backends::VULKAN
-            | eframe::wgpu::Backends::GL;
+        setup.instance_descriptor.backends =
+            eframe::wgpu::Backends::from_env().unwrap_or_else(|| match settings.theme.backend {
+                config::WgpuBackend::Auto => {
+                    eframe::wgpu::Backends::DX12
+                        | eframe::wgpu::Backends::VULKAN
+                        | eframe::wgpu::Backends::GL
+                }
+                config::WgpuBackend::Dx12 => eframe::wgpu::Backends::DX12,
+                config::WgpuBackend::Vulkan => eframe::wgpu::Backends::VULKAN,
+                config::WgpuBackend::Gl => eframe::wgpu::Backends::GL,
+            });
         setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
         setup.device_descriptor = Arc::new(|adapter| {
             let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
@@ -83,7 +123,7 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         persist_window: false,
-        centered: session.window_pos.is_none(),
+        centered: !has_position,
         ..Default::default()
     };
 

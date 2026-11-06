@@ -45,6 +45,16 @@ pub enum BackgroundMode {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum WgpuBackend {
+    #[default]
+    Auto,
+    Dx12,
+    Vulkan,
+    Gl,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ListDensity {
     Compact,
     #[default]
@@ -131,27 +141,20 @@ pub enum ProxyMode {
 pub enum SourceKind {
     #[default]
     Local,
-    Kuwo,
-    Netease,
-    Qq,
+    /// Generic Bamboo-compatible endpoint. The address is intentionally blank
+    /// until the user configures it.
+    Online,
 }
 
 impl SourceKind {
     pub fn default_script(self) -> &'static str {
         match self {
-            Self::Local => "local.php",
-            Self::Kuwo => "onlinea.php",
-            Self::Netease | Self::Qq => "main.php",
+            Self::Local | Self::Online => "local.php",
         }
     }
 
     pub fn default_prefix(self) -> &'static str {
-        match self {
-            Self::Local => "",
-            Self::Kuwo => "A_",
-            Self::Netease => "B_",
-            Self::Qq => "D_",
-        }
+        ""
     }
 }
 
@@ -221,6 +224,7 @@ pub struct ThemeSettings {
     pub reduce_motion: bool,
     pub list_density: ListDensity,
     pub sidebar_width: f32,
+    pub backend: WgpuBackend,
 }
 
 impl Default for ThemeSettings {
@@ -239,6 +243,7 @@ impl Default for ThemeSettings {
             reduce_motion: false,
             list_density: ListDensity::Comfortable,
             sidebar_width: 220.0,
+            backend: WgpuBackend::Auto,
         }
     }
 }
@@ -296,6 +301,8 @@ pub struct WindowSettings {
     pub minimize_to_tray: bool,
     pub capture_protection: bool,
     pub remember_size: bool,
+    pub trim_working_set_on_idle: bool,
+    pub trim_idle_secs: u64,
 }
 
 impl Default for WindowSettings {
@@ -307,6 +314,8 @@ impl Default for WindowSettings {
             minimize_to_tray: true,
             capture_protection: false,
             remember_size: true,
+            trim_working_set_on_idle: true,
+            trim_idle_secs: 30,
         }
     }
 }
@@ -465,21 +474,29 @@ impl Default for SourceConfig {
 
 impl SourceConfig {
     pub fn preset(kind: SourceKind) -> Self {
-        let (id, name, base) = match kind {
-            SourceKind::Local => ("local", "本地曲库", "http://127.0.0.1/musicnew/apis/local"),
-            SourceKind::Kuwo => ("kuwo", "酷我", "http://127.0.0.1/musicnew/apis/onlinea"),
-            SourceKind::Netease => ("netease", "网易云", "http://127.0.0.1/musicnew/apis/onlineb"),
-            SourceKind::Qq => ("qq", "QQ 音乐", "http://127.0.0.1/musicnew/apis/onlined"),
-        };
-        Self {
-            id: id.to_string(),
-            name: name.to_string(),
-            kind,
-            base_url: base.to_string(),
-            script: kind.default_script().to_string(),
-            prefix: kind.default_prefix().to_string(),
-            enabled: kind == SourceKind::Local,
-            ..Default::default()
+        match kind {
+            SourceKind::Local => Self {
+                id: "local".to_string(),
+                name: "本地曲库".to_string(),
+                kind,
+                base_url: "http://127.0.0.1/musicnew/apis/local".to_string(),
+                script: "local.php".to_string(),
+                prefix: String::new(),
+                enabled: true,
+                quality: Quality::K320,
+                ..Default::default()
+            },
+            SourceKind::Online => Self {
+                id: "online".to_string(),
+                name: "在线音源".to_string(),
+                kind,
+                base_url: String::new(),
+                script: "local.php".to_string(),
+                prefix: String::new(),
+                enabled: false,
+                quality: Quality::K320,
+                ..Default::default()
+            },
         }
     }
 
@@ -676,6 +693,22 @@ impl Default for DesktopLyricsSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct PlaylistSettings {
+    pub auto_refresh_on_startup: bool,
+    pub export_utf8_bom: bool,
+}
+
+impl Default for PlaylistSettings {
+    fn default() -> Self {
+        Self {
+            auto_refresh_on_startup: true,
+            export_utf8_bom: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LibrarySettings {
     pub folders: Vec<PathBuf>,
     pub scan_on_start: bool,
@@ -819,6 +852,7 @@ pub struct Settings {
     pub network: NetworkSettings,
     pub lyrics: LyricsSettings,
     pub desktop_lyrics: DesktopLyricsSettings,
+    pub playlist: PlaylistSettings,
     pub library: LibrarySettings,
     pub download: DownloadSettings,
     pub notifications: NotificationSettings,
@@ -837,13 +871,12 @@ impl Default for Settings {
             features: FeatureToggles::default(),
             sources: vec![
                 SourceConfig::preset(SourceKind::Local),
-                SourceConfig::preset(SourceKind::Kuwo),
-                SourceConfig::preset(SourceKind::Netease),
-                SourceConfig::preset(SourceKind::Qq),
+                SourceConfig::preset(SourceKind::Online),
             ],
             network: NetworkSettings::default(),
             lyrics: LyricsSettings::default(),
             desktop_lyrics: DesktopLyricsSettings::default(),
+            playlist: PlaylistSettings::default(),
             library: LibrarySettings::default(),
             download: DownloadSettings::default(),
             notifications: NotificationSettings::default(),
@@ -863,6 +896,17 @@ impl Settings {
             self.playback.speed = 1.0;
         }
         self.playback.volume = self.playback.volume.clamp(0.0, 1.0);
+        // Older builds shipped Kuwo/Netease/QQ presets. Keep only the local
+        // source and one generic, user-configured online source.
+        self.sources
+            .retain(|s| !matches!(s.id.as_str(), "kuwo" | "netease" | "qq"));
+        if !self.sources.iter().any(|s| s.kind == SourceKind::Local) {
+            self.sources
+                .insert(0, SourceConfig::preset(SourceKind::Local));
+        }
+        if !self.sources.iter().any(|s| s.id == "online") {
+            self.sources.push(SourceConfig::preset(SourceKind::Online));
+        }
         if self.sources.is_empty() {
             self.sources = Settings::default().sources;
         }
@@ -894,6 +938,8 @@ pub struct Session {
     pub window_maximized: bool,
     pub desktop_lyrics_pos: Option<(f32, f32)>,
     pub desktop_lyrics_monitor: Option<usize>,
+    pub current_key: Option<String>,
+    pub playlist_path: Option<PathBuf>,
     pub saved_at: Option<String>,
 }
 

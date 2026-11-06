@@ -14,14 +14,29 @@ pub fn playlists(app: &mut App, ui: &mut Ui) {
         app.t("playlists.subtitle"),
         &colors,
         |ui| {
-            if widgets::secondary_button(ui, app.t("player.open_files"), &colors).clicked() {
-                app.open_files_dialog();
+            if widgets::secondary_button(ui, "导出歌单", &colors).clicked() {
+                app.export_playlist_dialog();
             }
-            if widgets::secondary_button(ui, app.t("player.clear_queue"), &colors).clicked() {
-                app.clear_queue();
+            if widgets::primary_button(ui, "导入歌单", &colors).clicked() {
+                app.import_playlist_dialog();
             }
         },
     );
+
+    if app.scan_active {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(
+                RichText::new(format!("正在后台扫描… 已发现 {} 首", app.scan_found))
+                    .size(11.5)
+                    .color(colors.text_weak),
+            );
+            if widgets::secondary_button(ui, "取消", &colors).clicked() {
+                app.cancel_scan();
+            }
+        });
+        ui.add_space(4.0);
+    }
 
     if app.queue.is_empty() {
         widgets::empty_state(
@@ -31,12 +46,37 @@ pub fn playlists(app: &mut App, ui: &mut Ui) {
             app.t("playlists.empty_hint"),
             &colors,
             |ui| {
-                if widgets::primary_button(ui, app.t("player.open_files"), &colors).clicked() {
+                if widgets::primary_button(ui, "导入歌单", &colors).clicked() {
+                    app.import_playlist_dialog();
+                }
+                if widgets::secondary_button(ui, app.t("player.open_files"), &colors).clicked() {
                     app.open_files_dialog();
                 }
             },
         );
         return;
+    }
+
+    if let Some(playlist) = app.current_playlist.clone() {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("当前歌单")
+                    .size(10.5)
+                    .color(colors.text_faint),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(playlist.display().to_string())
+                        .size(10.5)
+                        .color(colors.text_weak),
+                )
+                .wrap(),
+            );
+            if widgets::secondary_button(ui, "重新扫描", &colors).clicked() {
+                app.rescan_current_playlist();
+            }
+        });
+        ui.add_space(4.0);
     }
 
     // Toolbar.
@@ -85,8 +125,11 @@ pub fn playlists(app: &mut App, ui: &mut Ui) {
             app.cycle_repeat();
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if widgets::secondary_button(ui, "导出歌单", &colors).clicked() {
-                app.toast("歌单导出将在歌单阶段启用", ToastKind::Info);
+            if widgets::secondary_button(ui, app.t("player.clear_queue"), &colors).clicked() {
+                app.clear_queue();
+            }
+            if widgets::secondary_button(ui, app.t("player.open_files"), &colors).clicked() {
+                app.open_files_dialog();
             }
         });
     });

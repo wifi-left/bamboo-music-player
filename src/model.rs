@@ -70,10 +70,11 @@ pub struct Track {
 impl Track {
     pub fn local(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let title = path
+        let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
+        let (artist, title) = split_artist_title(&stem);
         let lossless = path
             .extension()
             .map(|e| {
@@ -84,6 +85,7 @@ impl Track {
         Self {
             source: TrackSource::Local { path },
             title,
+            artist,
             source_name: "本地".to_string(),
             lossless,
             ..Default::default()
@@ -109,6 +111,28 @@ impl Track {
             "未知歌手".to_string()
         } else {
             self.artist.clone()
+        }
+    }
+
+    /// Fill artist/title from "Artist - Title" file names when tags are absent.
+    pub fn apply_filename_fallback(&mut self) {
+        if !self.artist.trim().is_empty() {
+            return;
+        }
+        let Some(path) = self.source.path() else {
+            return;
+        };
+        let Some(stem) = path.file_stem() else {
+            return;
+        };
+        let stem = stem.to_string_lossy();
+        let (artist, title) = split_artist_title(&stem);
+        if artist.is_empty() {
+            return;
+        }
+        self.artist = artist;
+        if self.title.trim().is_empty() || self.title == stem {
+            self.title = title;
         }
     }
 
@@ -140,6 +164,19 @@ impl Track {
             _ => true,
         }
     }
+}
+
+/// "Artist - Title" file names are common in the target library; use them as
+/// a fallback when tags are missing.
+fn split_artist_title(stem: &str) -> (String, String) {
+    if let Some((artist, title)) = stem.split_once(" - ") {
+        let artist = artist.trim();
+        let title = title.trim();
+        if !artist.is_empty() && !title.is_empty() {
+            return (artist.to_string(), title.to_string());
+        }
+    }
+    (String::new(), stem.to_string())
 }
 
 /// Case-insensitive, slash-normalized path key on Windows.

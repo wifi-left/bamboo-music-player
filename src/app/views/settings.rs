@@ -6,7 +6,7 @@ use egui::{RichText, Ui};
 use crate::app::{App, ToastKind, widgets};
 use crate::config::{
     BackgroundMode, CloseBehavior, DesktopBackgroundMode, EqPreset, Language, LyricsEncoding,
-    LyricsAlign, ProxyMode, Quality, ReplayGainMode, SourceConfig, SourceKind, ThemeMode,
+    ProxyMode, Quality, ReplayGainMode, SourceKind, ThemeMode, WgpuBackend,
 };
 use crate::platform::window;
 
@@ -103,7 +103,10 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                 .clone()
                 .unwrap_or_else(|| "Microsoft YaHei UI".to_string());
             if ui
-                .add(egui::TextEdit::singleline(&mut family).desired_width(220.0))
+                .add(
+                    egui::TextEdit::singleline(&mut family)
+                        .desired_width(ui.available_width().min(240.0).max(120.0)),
+                )
                 .changed()
             {
                 app.settings.theme.font_family = if family.trim().is_empty() {
@@ -154,6 +157,39 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
             {
                 settings_changed = true;
             }
+        });
+        row(ui, "渲染后端", &colors, |ui| {
+            let mut backend = app.settings.theme.backend;
+            egui::ComboBox::from_id_salt("wgpu-backend")
+                .selected_text(backend_label(backend))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut backend, WgpuBackend::Auto, "自动（DX12 优先）");
+                    ui.selectable_value(&mut backend, WgpuBackend::Dx12, "DX12");
+                    ui.selectable_value(&mut backend, WgpuBackend::Vulkan, "Vulkan");
+                    ui.selectable_value(&mut backend, WgpuBackend::Gl, "OpenGL（低内存）");
+                });
+            if backend != app.settings.theme.backend {
+                app.settings.theme.backend = backend;
+                settings_changed = true;
+                app.toast("渲染后端将在下次启动时生效", ToastKind::Info);
+            }
+            if ui
+                .button("低内存")
+                .on_hover_text("切换到 OpenGL 后端，私有内存可降到约 60 MB；需重启生效")
+                .clicked()
+            {
+                app.settings.theme.backend = WgpuBackend::Gl;
+                settings_changed = true;
+                app.toast("已选择 OpenGL 低内存后端，请重启应用", ToastKind::Info);
+            }
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&app.gpu_info)
+                        .size(10.0)
+                        .color(colors.text_faint),
+                )
+                .wrap(),
+            );
         });
         row(ui, app.t("settings.language"), &colors, |ui| {
             let mut lang = app.settings.language;
@@ -617,6 +653,7 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                     .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             if ui.checkbox(&mut source.enabled, "").changed() {
                                 settings_changed = true;
@@ -640,8 +677,8 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                             if ui
                                 .add(
                                     egui::TextEdit::singleline(&mut source.base_url)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text("http://127.0.0.1/musicnew/apis/local"),
+                                        .desired_width(ui.available_width().max(140.0))
+                                        .hint_text("填写 Bamboo API 地址"),
                                 )
                                 .changed()
                             {
@@ -658,10 +695,13 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                             {
                                 settings_changed = true;
                             }
-                            ui.label(
-                                RichText::new("基址以 .php 结尾时直接使用")
-                                    .size(10.0)
-                                    .color(colors.text_faint),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("基址以 .php 结尾时直接使用")
+                                        .size(10.0)
+                                        .color(colors.text_faint),
+                                )
+                                .wrap(),
                             );
                         });
                         row(ui, &label_quality, &colors, |ui| {
@@ -677,7 +717,7 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                                 source.quality = quality;
                                 settings_changed = true;
                             }
-                            if matches!(kind, SourceKind::Netease | SourceKind::Qq) {
+                            if matches!(kind, SourceKind::Online) {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut source.session_key)
                                         .hint_text(&label_session)
@@ -709,19 +749,72 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                 ToastKind::Info,
             );
         }
-        ui.horizontal(|ui| {
-            for (kind, label) in [
-                (SourceKind::Kuwo, "酷我(A)"),
-                (SourceKind::Netease, "网易(B)"),
-                (SourceKind::Qq, "QQ(D)"),
-            ] {
-                let exists = app.settings.sources.iter().any(|s| s.kind == kind);
-                if !exists && ui.button(format!("添加 {label}")).clicked() {
-                    app.settings.sources.push(SourceConfig::preset(kind));
-                    settings_changed = true;
-                }
+        ui.label(
+            RichText::new("在线音源不会预填地址；填写 Bamboo API 地址并启用后生效。")
+                .size(10.5)
+                .color(colors.text_faint),
+        );
+    });
+    ui.add_space(12.0);
+
+    // ---------------------------------------------------------------- Playlist
+    cards(ui, &colors, "歌单", |ui| {
+        row(ui, "导入行为", &colors, |ui| {
+            if ui
+                .checkbox(
+                    &mut app.settings.playlist.auto_refresh_on_startup,
+                    "启动时重新展开当前歌单",
+                )
+                .changed()
+            {
+                settings_changed = true;
+            }
+            if ui
+                .checkbox(
+                    &mut app.settings.playlist.export_utf8_bom,
+                    "导出 UTF-8 BOM",
+                )
+                .changed()
+            {
+                settings_changed = true;
             }
         });
+        if let Some(playlist) = app.current_playlist.clone() {
+            long_value(ui, "当前歌单", &playlist.display().to_string(), &colors);
+            ui.horizontal(|ui| {
+                if widgets::secondary_button(ui, "重新扫描歌单", &colors).clicked() {
+                    app.rescan_current_playlist();
+                }
+                if widgets::secondary_button(ui, "导出到文件", &colors).clicked() {
+                    app.export_playlist_dialog();
+                }
+            });
+        } else {
+            ui.label(
+                RichText::new("尚未打开 .mp3list 歌单")
+                    .size(11.0)
+                    .color(colors.text_faint),
+            );
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if widgets::primary_button(ui, "导入歌单", &colors).clicked() {
+                app.import_playlist_dialog();
+            }
+            if widgets::secondary_button(ui, "导出当前队列", &colors).clicked() {
+                app.export_playlist_dialog();
+            }
+        });
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "每次导入都会重新扫描 #SEARCH# 目录；当前曲目按文件路径匹配，并用上次保存的播放位置恢复。",
+                )
+                .size(10.5)
+                .color(colors.text_faint),
+            )
+            .wrap(),
+        );
     });
     ui.add_space(12.0);
 
@@ -758,6 +851,15 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
             }
             if ui
                 .checkbox(&mut app.settings.window.remember_position, "记住窗口位置")
+                .changed()
+            {
+                settings_changed = true;
+            }
+            if ui
+                .checkbox(
+                    &mut app.settings.window.trim_working_set_on_idle,
+                    "空闲时自动释放内存",
+                )
                 .changed()
             {
                 settings_changed = true;
@@ -865,9 +967,9 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
             if app.paths.portable { "是" } else { "否" },
             &colors,
         );
-        widgets::key_value(ui, "数据目录", &app.paths.root.display().to_string(), &colors);
+        long_value(ui, "数据目录", &app.paths.root.display().to_string(), &colors);
         if let Some(mem) = app.memory_info {
-            widgets::key_value(
+            long_value(
                 ui,
                 "内存占用",
                 &format!(
@@ -919,6 +1021,7 @@ fn cards<R>(
     add: impl FnOnce(&mut Ui) -> R,
 ) -> R {
     widgets::card(ui, colors, |ui| {
+        ui.set_width(ui.available_width());
         ui.label(RichText::new(title).size(15.0).strong().color(colors.text));
         ui.add_space(8.0);
         add(ui)
@@ -932,12 +1035,34 @@ fn row(
     add: impl FnOnce(&mut Ui),
 ) {
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [150.0, 24.0],
-            egui::Label::new(RichText::new(label).size(12.0).color(colors.text_weak)),
+        ui.allocate_ui_with_layout(
+            egui::vec2(150.0, 22.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(label).size(12.0).color(colors.text_weak),
+                    )
+                    .wrap(),
+                );
+            },
         );
-        add(ui);
+        ui.horizontal_wrapped(|ui| add(ui));
     });
+}
+
+fn long_value(
+    ui: &mut Ui,
+    label: &str,
+    value: &str,
+    colors: &crate::app::theme::ThemeColors,
+) {
+    ui.label(RichText::new(label).size(10.5).color(colors.text_weak));
+    ui.add(
+        egui::Label::new(RichText::new(value).size(11.0).color(colors.text))
+            .wrap(),
+    );
+    ui.add_space(4.0);
 }
 
 fn theme_label(mode: ThemeMode) -> &'static str {
@@ -945,6 +1070,15 @@ fn theme_label(mode: ThemeMode) -> &'static str {
         ThemeMode::System => "跟随系统",
         ThemeMode::Dark => "深色",
         ThemeMode::Light => "浅色",
+    }
+}
+
+fn backend_label(backend: WgpuBackend) -> &'static str {
+    match backend {
+        WgpuBackend::Auto => "自动（DX12 优先）",
+        WgpuBackend::Dx12 => "DX12",
+        WgpuBackend::Vulkan => "Vulkan",
+        WgpuBackend::Gl => "OpenGL（低内存）",
     }
 }
 
@@ -1021,8 +1155,6 @@ fn eq_label(preset: EqPreset) -> &'static str {
 fn source_kind_label(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Local => "本地",
-        SourceKind::Kuwo => "酷我",
-        SourceKind::Netease => "网易云",
-        SourceKind::Qq => "QQ 音乐",
+        SourceKind::Online => "在线",
     }
 }

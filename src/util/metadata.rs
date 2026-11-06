@@ -19,6 +19,12 @@ pub struct LocalMeta {
 }
 
 pub fn read_local(path: &Path) -> Option<LocalMeta> {
+    read_local_with_cover(path, true)
+}
+
+/// `with_cover = false` is used by the bulk scanner so it does not decode
+/// embedded artwork for thousands of files.
+pub fn read_local_with_cover(path: &Path, with_cover: bool) -> Option<LocalMeta> {
     let tagged = lofty::probe::read_from_path(path).ok()?;
     let mut meta = LocalMeta::default();
 
@@ -34,8 +40,10 @@ pub fn read_local(path: &Path) -> Option<LocalMeta> {
         }
         meta.track_no = tag.track();
         meta.genre = tag.genre().map(|g| g.to_string());
-        if let Some(pic) = tag.pictures().first() {
-            meta.cover = Some(pic.data().to_vec());
+        if with_cover {
+            if let Some(pic) = tag.pictures().first() {
+                meta.cover = Some(pic.data().to_vec());
+            }
         }
     }
 
@@ -122,9 +130,7 @@ impl MetadataService {
             .name("bamboo-metadata".to_string())
             .spawn(move || {
                 while let Ok(path) = request_rx.recv() {
-                    if let Some(mut meta) = read_local(&path) {
-                        // Covers are loaded lazily for the current track only.
-                        meta.cover = None;
+                    if let Some(meta) = read_local_with_cover(&path, false) {
                         let _ = result_tx.send((crate::model::normalize_path(&path), meta));
                     }
                 }
@@ -142,9 +148,17 @@ impl MetadataService {
     }
 
     pub fn poll(&self) -> Vec<(String, LocalMeta)> {
+        self.poll_batch(usize::MAX)
+    }
+
+    /// Drain at most `max` updates so a huge library cannot stall a frame.
+    pub fn poll_batch(&self, max: usize) -> Vec<(String, LocalMeta)> {
         let mut out = Vec::new();
-        while let Ok(item) = self.results.try_recv() {
-            out.push(item);
+        while out.len() < max {
+            match self.results.try_recv() {
+                Ok(item) => out.push(item),
+                Err(_) => break,
+            }
         }
         out
     }

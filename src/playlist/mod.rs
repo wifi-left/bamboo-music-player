@@ -1,8 +1,12 @@
 //! Playback queue with shuffle order, repeat modes and de-duplication.
 
+use std::collections::HashSet;
+
 use rand::seq::SliceRandom;
 
 use crate::model::{RepeatMode, Track};
+
+pub mod mp3list;
 
 #[derive(Clone, Debug, Default)]
 pub struct Queue {
@@ -13,6 +17,8 @@ pub struct Queue {
     /// Indices into `items` in shuffled display order.
     pub shuffle_order: Vec<usize>,
     pub history: Vec<usize>,
+    /// O(1) de-duplication for very large queues.
+    pub keys: HashSet<String>,
 }
 
 impl Queue {
@@ -29,12 +35,21 @@ impl Queue {
         self.current = None;
         self.shuffle_order.clear();
         self.history.clear();
+        self.keys.clear();
+    }
+
+    pub fn rebuild_keys(&mut self) {
+        self.keys = self
+            .items
+            .iter()
+            .map(|t| t.dedupe_key())
+            .collect::<HashSet<_>>();
     }
 
     /// Returns true when the track was actually added (not a duplicate).
     pub fn add(&mut self, track: Track) -> bool {
         let key = track.dedupe_key();
-        if self.items.iter().any(|t| t.dedupe_key() == key) {
+        if !self.keys.insert(key) {
             return false;
         }
         let idx = self.items.len();
@@ -211,6 +226,7 @@ impl Queue {
             return None;
         }
         let removed = self.items.remove(index);
+        self.keys.remove(&removed.dedupe_key());
         self.shuffle_order.retain(|i| *i != index);
         for i in self.shuffle_order.iter_mut() {
             if *i > index {

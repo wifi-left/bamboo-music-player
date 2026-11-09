@@ -1,5 +1,30 @@
-/target
+# Rust / Cargo build artifacts (includes debug/release/test binaries)
+/target/
+/dist/
+*.pdb
+*.exe
+*.dll
+*.lib
+*.rlib
+*.rmeta
+
+# Test output, screenshots and scratch files
+/test-output/
+/tests-output/
+/screenshots/
+/captures/
 /shot*.png
-*.log
+/test-*.png
+/test_*.png
+*.part
+*.part.meta
 *.tmp
-/.zcode
+*.log
+
+# Local tooling caches
+/.zcode/
+__pycache__/
+*.pyc
+
+# Local handoff notes
+/HANDOFF.md

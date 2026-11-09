@@ -7,14 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TrackSource {
-    Local { path: PathBuf },
-    Url { url: String },
+    Local {
+        path: PathBuf,
+    },
+    Url {
+        url: String,
+    },
     Bamboo {
         source_id: String,
         song_id: String,
         base_url: String,
     },
-    Radio { url: String },
+    Radio {
+        url: String,
+    },
 }
 
 impl Default for TrackSource {
@@ -100,7 +106,7 @@ impl Track {
             TrackSource::Local { path } => path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "未知曲目".to_string()),
+                .unwrap_or_else(|| crate::i18n::tr("未知曲目").to_string()),
             TrackSource::Url { url } | TrackSource::Radio { url } => url.clone(),
             TrackSource::Bamboo { song_id, .. } => song_id.clone(),
         }
@@ -108,7 +114,7 @@ impl Track {
 
     pub fn display_artist(&self) -> String {
         if self.artist.trim().is_empty() {
-            "未知歌手".to_string()
+            crate::i18n::tr("未知歌手").to_string()
         } else {
             self.artist.clone()
         }
@@ -143,6 +149,23 @@ impl Track {
         } else {
             format!("{} · {}", artist, self.album)
         }
+    }
+
+    /// Case-insensitive match used by the queue filter. Empty queries match
+    /// every track.
+    pub fn matches_query(&self, query: &str) -> bool {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        [
+            self.display_title(),
+            self.artist.clone(),
+            self.album.clone(),
+            self.source_name.clone(),
+        ]
+        .iter()
+        .any(|field| field.to_lowercase().contains(&needle))
     }
 
     /// Stable key used for de-duplication across queue/playlists.
@@ -205,14 +228,14 @@ impl RepeatMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off => "顺序播放",
-            Self::All => "列表循环",
-            Self::One => "单曲循环",
+            Self::Off => crate::i18n::tr("顺序播放"),
+            Self::All => crate::i18n::tr("列表循环"),
+            Self::One => crate::i18n::tr("单曲循环"),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Page {
     #[default]
@@ -233,4 +256,23 @@ impl Page {
         Page::Discover,
         Page::Settings,
     ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_query_matches_title_artist_album_and_source() {
+        let mut track = Track::local("C:/music/song.mp3");
+        track.title = "Midnight City".to_string();
+        track.artist = "M83".to_string();
+        track.album = "Hurry Up".to_string();
+        track.source_name = "本地".to_string();
+        assert!(track.matches_query(""));
+        assert!(track.matches_query("midnight"));
+        assert!(track.matches_query("  M83 "));
+        assert!(track.matches_query("hurry"));
+        assert!(!track.matches_query("jazz"));
+    }
 }

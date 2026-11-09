@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::model::{Page, RepeatMode, Track};
 
@@ -53,6 +53,34 @@ pub enum WgpuBackend {
     Gl,
 }
 
+/// Which physical GPU wgpu should prefer.
+///
+/// Laptops with a discrete GPU often pick the integrated one when the app
+/// asks for low power. For an immediate-mode UI that redraws the whole window
+/// every frame the integrated GPU is frequently the slower, hotter choice, so
+/// this is configurable instead of hard-coded.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuPowerPreference {
+    /// Let wgpu/driver decide (usually the best available GPU when on AC).
+    #[default]
+    Auto,
+    /// Prefer the integrated/low-power GPU.
+    LowPower,
+    /// Prefer the discrete/highest-performance GPU.
+    HighPerformance,
+}
+
+impl GpuPowerPreference {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => crate::i18n::tr("自动（推荐）"),
+            Self::LowPower => crate::i18n::tr("省电（核显）"),
+            Self::HighPerformance => crate::i18n::tr("高性能（独显）"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ListDensity {
@@ -60,6 +88,50 @@ pub enum ListDensity {
     #[default]
     Comfortable,
     Spacious,
+}
+
+/// How much tag metadata is read from local files.
+///
+/// Reading every file's tags during a large scan is the most expensive part
+/// of importing a folder, so the default only loads the current track.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataMode {
+    /// Never read tags; titles come from file names.
+    Off,
+    /// Read tags when a track is played or restored (recommended).
+    #[default]
+    CurrentOnly,
+    /// Read tags for every queued file in the background.
+    All,
+}
+
+impl MetadataMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => crate::i18n::tr("关闭（最快）"),
+            Self::CurrentOnly => crate::i18n::tr("仅当前曲目（推荐）"),
+            Self::All => crate::i18n::tr("全部曲目（后台）"),
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn background_all(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenMode {
+    /// Borderless window covering the monitor (default, no display-mode switch).
+    #[default]
+    Borderless,
+    /// Borderless maximized window; taskbar remains visible.
+    Maximized,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -80,6 +152,19 @@ pub enum ReplayGainMode {
     Album,
 }
 
+/// How the library duplicate finder decides two rows describe the same audio.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupeMode {
+    /// Title + artist, with durations within 1.5 seconds of each other.
+    #[default]
+    Metadata,
+    /// Rows that resolve to the same file (case differences, symlinks, hard links).
+    Path,
+    /// Decoded-audio fingerprint; tolerates different tags and most re-encodes.
+    Fingerprint,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EqPreset {
@@ -92,6 +177,22 @@ pub enum EqPreset {
     Vocal,
     Bass,
     Custom,
+}
+
+impl EqPreset {
+    /// Band gains in dB for [`crate::audio::EQ_BANDS_HZ`].
+    pub fn bands(self) -> [f32; 10] {
+        match self {
+            Self::Flat => [0.0; 10],
+            Self::Rock => [5.0, 4.0, 2.5, 0.5, -1.0, -1.0, 0.0, 2.0, 3.5, 4.5],
+            Self::Pop => [-1.0, 0.5, 2.0, 4.0, 4.0, 2.0, 0.0, -0.5, -1.0, -1.0],
+            Self::Jazz => [3.5, 2.5, 1.0, 2.0, -0.5, -0.5, 0.0, 1.0, 2.0, 3.0],
+            Self::Classical => [3.0, 2.0, 1.0, 0.0, -0.5, -0.5, 0.0, 1.0, 2.0, 3.0],
+            Self::Vocal => [-2.0, -1.5, 0.0, 2.5, 4.5, 4.0, 3.0, 1.0, 0.0, -1.0],
+            Self::Bass => [7.0, 6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            Self::Custom => [0.0; 10],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -146,18 +247,6 @@ pub enum SourceKind {
     Online,
 }
 
-impl SourceKind {
-    pub fn default_script(self) -> &'static str {
-        match self {
-            Self::Local | Self::Online => "local.php",
-        }
-    }
-
-    pub fn default_prefix(self) -> &'static str {
-        ""
-    }
-}
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Quality {
@@ -180,7 +269,7 @@ impl Quality {
         match self {
             Self::K128 => "128 kbps",
             Self::K320 => "320 kbps",
-            Self::Flac => "无损 FLAC",
+            Self::Flac => crate::i18n::tr("无损 FLAC"),
         }
     }
 }
@@ -225,6 +314,10 @@ pub struct ThemeSettings {
     pub list_density: ListDensity,
     pub sidebar_width: f32,
     pub backend: WgpuBackend,
+    /// Preferred physical GPU; takes effect on the next start.
+    pub gpu_power: GpuPowerPreference,
+    /// Additional UI zoom on top of the system DPI scale (accessibility).
+    pub ui_scale: f32,
 }
 
 impl Default for ThemeSettings {
@@ -238,12 +331,14 @@ impl Default for ThemeSettings {
             background_opacity: 0.45,
             font_family: Some("Microsoft YaHei UI".to_string()),
             font_size: 14.0,
-            roundness: 12,
+            roundness: 8,
             animations: true,
             reduce_motion: false,
             list_density: ListDensity::Comfortable,
             sidebar_width: 220.0,
             backend: WgpuBackend::Auto,
+            gpu_power: GpuPowerPreference::Auto,
+            ui_scale: 1.0,
         }
     }
 }
@@ -261,6 +356,9 @@ pub struct PlaybackSettings {
     pub gapless: bool,
     pub replaygain: ReplayGainMode,
     pub replaygain_preamp_db: f32,
+    /// Analyze files that carry no ReplayGain tags (EBU R128). Results are
+    /// cached, so each file is only measured once.
+    pub replaygain_scan: bool,
     pub eq_enabled: bool,
     pub eq_preset: EqPreset,
     pub eq_bands: [f32; 10],
@@ -282,6 +380,7 @@ impl Default for PlaybackSettings {
             gapless: true,
             replaygain: ReplayGainMode::Off,
             replaygain_preamp_db: 0.0,
+            replaygain_scan: true,
             eq_enabled: false,
             eq_preset: EqPreset::Flat,
             eq_bands: [0.0; 10],
@@ -300,9 +399,18 @@ pub struct WindowSettings {
     pub start_minimized: bool,
     pub minimize_to_tray: bool,
     pub capture_protection: bool,
+    /// Exclude the standalone lyrics window from screen capture.
+    pub lyrics_capture_protection: bool,
     pub remember_size: bool,
     pub trim_working_set_on_idle: bool,
     pub trim_idle_secs: u64,
+    pub lyrics_fullscreen: FullscreenMode,
+    /// Display used by the fullscreen lyrics page (index into the monitor
+    /// list, left to right). `None` follows the window's current display.
+    pub lyrics_monitor: Option<usize>,
+    /// Launch a new window even when another instance is running. Requires a
+    /// restart because the single-instance guard runs at startup.
+    pub allow_multiple_instances: bool,
 }
 
 impl Default for WindowSettings {
@@ -313,10 +421,88 @@ impl Default for WindowSettings {
             start_minimized: false,
             minimize_to_tray: true,
             capture_protection: false,
+            lyrics_capture_protection: false,
             remember_size: true,
             trim_working_set_on_idle: true,
             trim_idle_secs: 30,
+            lyrics_fullscreen: FullscreenMode::Borderless,
+            lyrics_monitor: None,
+            allow_multiple_instances: false,
         }
+    }
+}
+
+/// Startup, loading and memory trade-offs. Every switch is optional so users
+/// can pick between fastest startup and the richest list metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PerformanceSettings {
+    pub metadata_mode: MetadataMode,
+    /// Decode embedded/sidecar cover art for the current track.
+    pub load_covers: bool,
+    /// Generate the blurred cover background texture.
+    pub cover_background: bool,
+    /// Create the audio output device on first playback instead of at launch.
+    pub lazy_audio: bool,
+    /// Pause the audio output stream while stopped/paused to save power.
+    pub release_audio_output: bool,
+    /// Restore a paused session without opening the decoder until Play.
+    pub defer_paused_restore: bool,
+    /// UI/animation refresh rate while the player is visible. Lower values
+    /// save power; higher values keep karaoke highlighting and scrolling
+    /// smooth.
+    pub frame_rate: u32,
+    /// Refresh rate used when nothing on screen is animating (a playing
+    /// progress bar and the time labels). Lower values save power without
+    /// changing the rendered result.
+    pub idle_frame_rate: u32,
+    /// Keep the GPU "flow" background animating. Turning this off keeps the
+    /// same background image but holds it still.
+    pub background_animation: bool,
+    /// Refresh rate of the animated flow background. 30 fps looks smooth for
+    /// the slow ambient motion and costs roughly half the GPU time of 60 fps.
+    pub background_frame_rate: u32,
+    /// Stop background/visualizer animation while the window is unfocused or
+    /// minimized. The UI still updates at `idle_frame_rate`.
+    pub pause_animations_unfocused: bool,
+    /// Maximum number of decoded online cover thumbnails kept in memory.
+    /// Zero means unlimited.
+    pub thumbnail_cache: u32,
+}
+
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        Self {
+            metadata_mode: MetadataMode::CurrentOnly,
+            load_covers: true,
+            cover_background: true,
+            lazy_audio: true,
+            release_audio_output: true,
+            defer_paused_restore: true,
+            frame_rate: 60,
+            idle_frame_rate: 15,
+            background_animation: true,
+            background_frame_rate: 30,
+            pause_animations_unfocused: true,
+            thumbnail_cache: 256,
+        }
+    }
+}
+
+impl PerformanceSettings {
+    /// Repaint interval used by lyrics/animation surfaces.
+    pub fn frame_millis(&self) -> u64 {
+        (1000 / self.frame_rate.clamp(15, 120)).max(8) as u64
+    }
+
+    /// Repaint interval for a playing window with no active animation.
+    pub fn idle_millis(&self) -> u64 {
+        (1000 / self.idle_frame_rate.clamp(2, 120)) as u64
+    }
+
+    /// Repaint interval for the animated background shader.
+    pub fn background_millis(&self) -> u64 {
+        (1000 / self.background_frame_rate.clamp(15, 120)).max(8) as u64
     }
 }
 
@@ -339,7 +525,6 @@ pub struct FeatureToggles {
     pub downloads: bool,
     pub stream_cache: bool,
     pub discover: bool,
-    pub advanced_network: bool,
     pub mini_player: bool,
     pub fullscreen_lyrics: bool,
     pub visualizer: bool,
@@ -347,10 +532,13 @@ pub struct FeatureToggles {
     pub jump_list: bool,
     pub start_with_windows: bool,
     pub file_associations: bool,
+    /// `.mp3list` playlist association (independent from audio files).
+    pub playlist_associations: bool,
     pub command_palette: bool,
     pub accessibility: bool,
     pub tray: bool,
     pub desktop_lyrics: bool,
+    pub media_controls: bool,
 }
 
 impl Default for FeatureToggles {
@@ -371,7 +559,6 @@ impl Default for FeatureToggles {
             downloads: true,
             stream_cache: true,
             discover: true,
-            advanced_network: true,
             mini_player: true,
             fullscreen_lyrics: true,
             visualizer: true,
@@ -379,10 +566,12 @@ impl Default for FeatureToggles {
             jump_list: true,
             start_with_windows: false,
             file_associations: false,
+            playlist_associations: false,
             command_palette: true,
             accessibility: true,
             tray: true,
             desktop_lyrics: true,
+            media_controls: true,
         }
     }
 }
@@ -545,6 +734,11 @@ pub struct NetworkSettings {
     pub proxy_url: String,
     pub user_agent: String,
     pub offline: bool,
+    /// Minimum delay between consecutive API requests (0 = unlimited).
+    /// Audio streaming and downloads are not throttled.
+    pub api_min_interval_ms: u64,
+    /// Page size for album/artist detail requests.
+    pub album_page_size: u32,
     pub cache_limit_mb: u64,
     pub stream_cache_dir: Option<PathBuf>,
 }
@@ -559,6 +753,8 @@ impl Default for NetworkSettings {
             proxy_url: String::new(),
             user_agent: format!("BambooPlayer/{}", env!("CARGO_PKG_VERSION")),
             offline: false,
+            api_min_interval_ms: 0,
+            album_page_size: 100,
             cache_limit_mb: 1024,
             stream_cache_dir: None,
         }
@@ -573,7 +769,13 @@ pub struct LyricsSettings {
     pub offset_ms: i64,
     pub auto_load: bool,
     pub show_translation: bool,
+    /// Preferred translation sidecar region (`auto`, `zh`, `en`, `jp`, …).
+    /// Sidecars use the `A.<region>.lrc` / `A.<region>.srt` naming scheme.
+    pub translation_language: String,
     pub karaoke: bool,
+    /// Only run karaoke highlighting when the line carries word timings
+    /// (enhanced LRC); plain timed LRC keeps whole-line highlighting.
+    pub karaoke_words_only: bool,
     pub font_size: f32,
     pub font_family: Option<String>,
     pub current_color: [u8; 3],
@@ -585,6 +787,9 @@ pub struct LyricsSettings {
     pub prefetch_next: bool,
     pub sidebar_visible: bool,
     pub offset_step_ms: i64,
+    /// Smoothly animate the lyric auto-scroll (also requires global animations
+    /// and not "reduce motion").
+    pub scroll_animation: bool,
 }
 
 impl Default for LyricsSettings {
@@ -595,7 +800,9 @@ impl Default for LyricsSettings {
             offset_ms: 0,
             auto_load: true,
             show_translation: true,
+            translation_language: "auto".to_string(),
             karaoke: true,
+            karaoke_words_only: false,
             font_size: 17.0,
             font_family: None,
             current_color: [255, 255, 255],
@@ -607,6 +814,50 @@ impl Default for LyricsSettings {
             prefetch_next: true,
             sidebar_visible: false,
             offset_step_ms: 500,
+            scroll_animation: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+/// Appearance of the immersive full-screen lyrics page and the standalone
+/// lyrics window. Kept separate from the small panel/sidebar so the large
+/// layouts can use their own type size and colors.
+pub struct LargeLyricsSettings {
+    pub font_size: f32,
+    /// Optional system font family for the large/full-screen and standalone
+    /// lyrics surfaces. `None` follows the interface font.
+    pub font_family: Option<String>,
+    pub line_spacing: f32,
+    pub align: LyricsAlign,
+    pub show_translation: bool,
+    pub karaoke: bool,
+    pub karaoke_words_only: bool,
+    pub current_color: [u8; 3],
+    pub normal_color: [u8; 3],
+    pub translation_color: [u8; 3],
+    pub show_cover: bool,
+    pub show_title: bool,
+    pub show_footer: bool,
+}
+
+impl Default for LargeLyricsSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 23.0,
+            font_family: None,
+            line_spacing: 14.0,
+            align: LyricsAlign::Center,
+            show_translation: true,
+            karaoke: true,
+            karaoke_words_only: false,
+            current_color: [255, 255, 255],
+            normal_color: [150, 160, 180],
+            translation_color: [130, 142, 165],
+            show_cover: true,
+            show_title: true,
+            show_footer: true,
         }
     }
 }
@@ -623,11 +874,17 @@ pub struct DesktopLyricsSettings {
     pub show_translation: bool,
     pub show_footer: bool,
     pub font_family: Option<String>,
+    /// Current line font size.
     pub font_size: f32,
+    pub next_font_size: f32,
+    pub prev_font_size: f32,
+    pub footer_font_size: f32,
     pub bold: bool,
     pub align: LyricsAlign,
     pub current_color: [u8; 4],
     pub next_color: [u8; 4],
+    pub prev_color: [u8; 4],
+    pub footer_color: [u8; 4],
     pub translation_color: [u8; 4],
     pub background: DesktopBackgroundMode,
     pub bg_color: [u8; 4],
@@ -639,6 +896,21 @@ pub struct DesktopLyricsSettings {
     pub line_spacing: f32,
     pub shadow: bool,
     pub outline: bool,
+    /// Apply the same outline/shadow treatment to the translation line.
+    pub translation_outline: bool,
+    pub translation_shadow: bool,
+    /// Apply the same outline/shadow treatment to the footer (title/artist).
+    pub footer_outline: bool,
+    pub footer_shadow: bool,
+    /// Draw the rounded panel border. Independent from the text shadow.
+    pub border: bool,
+    /// Native window drop shadow. Turn off for a fully transparent overlay
+    /// so the system does not draw a shadow around an invisible rectangle.
+    pub window_shadow: bool,
+    pub outline_color: [u8; 4],
+    pub outline_width: f32,
+    pub shadow_color: [u8; 4],
+    pub shadow_offset: f32,
     pub capture_protection: bool,
     pub monitor: Option<usize>,
     pub width: f32,
@@ -647,6 +919,8 @@ pub struct DesktopLyricsSettings {
     pub hide_when_paused: bool,
     pub hide_when_fullscreen: bool,
     pub karaoke: bool,
+    /// Only run karaoke highlighting for enhanced LRC (word timings).
+    pub karaoke_words_only: bool,
     pub position: Option<(f32, f32)>,
 }
 
@@ -663,10 +937,15 @@ impl Default for DesktopLyricsSettings {
             show_footer: true,
             font_family: None,
             font_size: 34.0,
+            next_font_size: 26.0,
+            prev_font_size: 24.0,
+            footer_font_size: 13.0,
             bold: true,
             align: LyricsAlign::Center,
             current_color: [255, 255, 255, 255],
             next_color: [170, 185, 215, 235],
+            prev_color: [150, 162, 190, 220],
+            footer_color: [200, 210, 230, 220],
             translation_color: [145, 158, 185, 210],
             background: DesktopBackgroundMode::Solid,
             bg_color: [14, 17, 26, 185],
@@ -678,6 +957,16 @@ impl Default for DesktopLyricsSettings {
             line_spacing: 6.0,
             shadow: true,
             outline: false,
+            translation_outline: false,
+            translation_shadow: false,
+            footer_outline: false,
+            footer_shadow: false,
+            border: true,
+            window_shadow: true,
+            outline_color: [0, 0, 0, 230],
+            outline_width: 1.0,
+            shadow_color: [0, 0, 0, 150],
+            shadow_offset: 2.0,
             capture_protection: false,
             monitor: None,
             width: 900.0,
@@ -686,6 +975,7 @@ impl Default for DesktopLyricsSettings {
             hide_when_paused: false,
             hide_when_fullscreen: true,
             karaoke: true,
+            karaoke_words_only: false,
             position: None,
         }
     }
@@ -715,6 +1005,7 @@ pub struct LibrarySettings {
     pub extensions: Vec<String>,
     pub auto_watch: bool,
     pub follow_symlinks: bool,
+    pub dedupe_mode: DedupeMode,
 }
 
 impl Default for LibrarySettings {
@@ -733,6 +1024,7 @@ impl Default for LibrarySettings {
             ],
             auto_watch: true,
             follow_symlinks: false,
+            dedupe_mode: DedupeMode::Metadata,
         }
     }
 }
@@ -839,6 +1131,91 @@ impl Default for ShortcutSettings {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RadioStation {
+    pub name: String,
+    pub url: String,
+    pub genre: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RadioSettings {
+    pub stations: Vec<RadioStation>,
+    /// URL of the station played most recently (for a quick resume).
+    pub last_station: Option<String>,
+}
+
+impl Default for RadioSettings {
+    fn default() -> Self {
+        // Discover now only exposes the local BambooMusic random station; the
+        // old SomaFM presets are intentionally not seeded anymore.
+        Self {
+            stations: Vec::new(),
+            last_station: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MiniPlayerSettings {
+    pub visible: bool,
+    pub always_on_top: bool,
+    pub opacity: f32,
+    pub position: Option<(f32, f32)>,
+    /// Show the current lyric line between the track info and the progress bar.
+    pub show_lyrics: bool,
+    /// Fill the syllable being sung instead of highlighting the whole line.
+    pub karaoke: bool,
+    /// Apply karaoke fill only to enhanced LRC lines that carry word timings.
+    /// When off, plain timed LRC lines get a proportional gradient fill too.
+    pub karaoke_words_only: bool,
+    /// Number of lyric lines to show (1 or 2).
+    pub lyrics_lines: u8,
+    pub lyrics_bold: bool,
+    /// Show the translation of the current line (if the lyrics have one).
+    pub show_translation: bool,
+    pub lyrics_font_size: f32,
+    /// Window width; drag-resizing the window updates it.
+    pub width: f32,
+    /// Derive the window height from the lyric options (desktop lyrics style).
+    pub auto_height: bool,
+    /// Manual window height, used when `auto_height` is off.
+    pub height: f32,
+    /// Show the mini-player button in the Windows taskbar.
+    pub show_in_taskbar: bool,
+    /// Draw the mini player with a native Direct2D layered window. This keeps
+    /// the main egui window out of the mini player's animation loop, so a
+    /// hidden main window no longer has to repaint just to advance the mini
+    /// player. Turn it off to fall back to the egui viewport.
+    pub native_window: bool,
+}
+
+impl Default for MiniPlayerSettings {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            always_on_top: true,
+            opacity: 0.94,
+            position: None,
+            show_lyrics: true,
+            karaoke: true,
+            karaoke_words_only: false,
+            lyrics_lines: 1,
+            lyrics_bold: false,
+            show_translation: true,
+            lyrics_font_size: 13.0,
+            width: 380.0,
+            auto_height: true,
+            height: 172.0,
+            show_in_taskbar: false,
+            native_window: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -851,13 +1228,17 @@ pub struct Settings {
     pub sources: Vec<SourceConfig>,
     pub network: NetworkSettings,
     pub lyrics: LyricsSettings,
+    pub large_lyrics: LargeLyricsSettings,
     pub desktop_lyrics: DesktopLyricsSettings,
     pub playlist: PlaylistSettings,
     pub library: LibrarySettings,
+    pub performance: PerformanceSettings,
     pub download: DownloadSettings,
     pub notifications: NotificationSettings,
     pub visualizer: VisualizerSettings,
     pub shortcuts: ShortcutSettings,
+    pub radio: RadioSettings,
+    pub mini: MiniPlayerSettings,
 }
 
 impl Default for Settings {
@@ -875,13 +1256,17 @@ impl Default for Settings {
             ],
             network: NetworkSettings::default(),
             lyrics: LyricsSettings::default(),
+            large_lyrics: LargeLyricsSettings::default(),
             desktop_lyrics: DesktopLyricsSettings::default(),
             playlist: PlaylistSettings::default(),
             library: LibrarySettings::default(),
+            performance: PerformanceSettings::default(),
             download: DownloadSettings::default(),
             notifications: NotificationSettings::default(),
             visualizer: VisualizerSettings::default(),
             shortcuts: ShortcutSettings::default(),
+            radio: RadioSettings::default(),
+            mini: MiniPlayerSettings::default(),
         }
     }
 }
@@ -896,6 +1281,10 @@ impl Settings {
             self.playback.speed = 1.0;
         }
         self.playback.volume = self.playback.volume.clamp(0.0, 1.0);
+        self.theme.ui_scale = self.theme.ui_scale.clamp(0.75, 1.6);
+        // Discover is now the local BambooMusic random station only. Drop the
+        // old preset/custom stream list so it cannot reappear in settings.
+        self.radio.stations.clear();
         // Older builds shipped Kuwo/Netease/QQ presets. Keep only the local
         // source and one generic, user-configured online source.
         self.sources
@@ -921,6 +1310,58 @@ impl Settings {
     }
 }
 
+/// A local file shown in the taskbar jump list's "recent" category.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecentFile {
+    pub path: PathBuf,
+    pub title: String,
+}
+
+/// A `.mp3list` / `.m3u` the user has opened, shown under “My playlists” in
+/// the sidebar. The file itself is the source of truth; this only remembers
+/// where it is and how recently it was used.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SavedPlaylist {
+    pub path: PathBuf,
+    /// Cached display name (the file stem when first imported).
+    pub name: String,
+    /// Unix seconds of the last import/open, used to keep the list ordered.
+    pub last_opened: u64,
+}
+
+impl SavedPlaylist {
+    pub fn new(path: PathBuf, last_opened: u64) -> Self {
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().trim().to_string())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| path.display().to_string());
+        Self {
+            path,
+            name,
+            last_opened,
+        }
+    }
+
+    /// Cached name with a fallback for hand-edited or older session files.
+    pub fn display_name(&self) -> String {
+        let name = self.name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        self.path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.trim().is_empty())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+}
+
+/// Keep the sidebar usable even after the user has opened many playlists.
+pub const MAX_SAVED_PLAYLISTS: usize = 24;
+
 /// Playback state persisted on exit and periodically while playing.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -939,8 +1380,68 @@ pub struct Session {
     pub desktop_lyrics_pos: Option<(f32, f32)>,
     pub desktop_lyrics_monitor: Option<usize>,
     pub current_key: Option<String>,
+    /// Whether the immersive lyrics page was open at exit.
+    pub fullscreen_lyrics: bool,
+    /// Whether the independent fullscreen lyrics window was open at exit.
+    pub lyrics_window: bool,
+    /// Whether that window was used as a normal resizable window instead of
+    /// borderless fullscreen.
+    pub lyrics_window_windowed: bool,
+    /// Remembered size of the windowed standalone lyrics window.
+    pub lyrics_window_size: Option<(f32, f32)>,
+    /// Remembered position of the windowed standalone lyrics window.
+    pub lyrics_window_pos: Option<(f32, f32)>,
+    /// Display order of the shuffle cycle, stored as stable track keys so the
+    /// order survives playlist re-imports and file additions.
+    pub shuffle_keys: Vec<String>,
     pub playlist_path: Option<PathBuf>,
+    /// Recently opened playlists (newest first), listed in the sidebar.
+    pub playlists: Vec<SavedPlaylist>,
+    /// Whether the local random station was active at exit.
+    pub station: bool,
+    /// Most recent station tracks (newest first), for the Discover history.
+    pub station_history: Vec<Track>,
+    /// Most recent local files (newest first), mirrored to the jump list.
+    pub recent_files: Vec<RecentFile>,
     pub saved_at: Option<String>,
+}
+
+impl Session {
+    /// Move `path` to the front of the saved-playlist list, creating it if
+    /// needed. Paths compare case-insensitively on Windows.
+    pub fn remember_playlist(&mut self, path: PathBuf, now: u64) {
+        let key = crate::model::normalize_path(&path);
+        self.playlists
+            .retain(|entry| crate::model::normalize_path(&entry.path) != key);
+        self.playlists.insert(0, SavedPlaylist::new(path, now));
+        self.playlists.truncate(MAX_SAVED_PLAYLISTS);
+    }
+
+    /// Remove one entry from “My playlists”. Returns true when it was present.
+    /// The file on disk and the current queue are not touched.
+    pub fn forget_playlist(&mut self, path: &Path) -> bool {
+        let key = crate::model::normalize_path(path);
+        let before = self.playlists.len();
+        self.playlists
+            .retain(|entry| crate::model::normalize_path(&entry.path) != key);
+        self.playlists.len() != before
+    }
+
+    #[cfg(test)]
+    pub fn has_playlist(&self, path: &Path) -> bool {
+        let key = crate::model::normalize_path(path);
+        self.playlists
+            .iter()
+            .any(|entry| crate::model::normalize_path(&entry.path) == key)
+    }
+}
+
+/// Current Unix time in whole seconds, used for saved-playlist ordering.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,12 +1537,26 @@ pub fn load_settings(path: &Path) -> Settings {
 }
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    write_json_atomic_with(path, value, true)
+}
+
+fn write_json_atomic_with<T: Serialize>(path: &Path, value: &T, pretty: bool) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
+    let data = if pretty {
+        serde_json::to_vec_pretty(value)
+    } else {
+        serde_json::to_vec(value)
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // Include the PID so two instances writing the same settings/session file
+    // never contend for the same temporary name.
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "json".to_string());
+    let tmp = path.with_extension(format!("{extension}.{}.tmp", std::process::id()));
     fs::write(&tmp, data)?;
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
@@ -1057,6 +1572,233 @@ pub fn save_settings(path: &Path, settings: &Settings) -> io::Result<()> {
     write_json_atomic(path, settings)
 }
 
+/// Sessions contain the whole queue, so they are written compactly; pretty
+/// printing a 10k-track queue wastes CPU and disk on every autosave.
 pub fn save_session(path: &Path, session: &Session) -> io::Result<()> {
-    write_json_atomic(path, session)
+    write_json_atomic_with(path, session, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_rate_is_clamped_to_safe_range() {
+        let mut performance = PerformanceSettings::default();
+        assert_eq!(performance.frame_rate, 60);
+        assert_eq!(performance.frame_millis(), 16);
+        performance.frame_rate = 15;
+        assert_eq!(performance.frame_millis(), 66);
+        performance.frame_rate = 240;
+        assert_eq!(performance.frame_millis(), 8);
+        performance.frame_rate = 0;
+        assert_eq!(performance.frame_millis(), 66);
+    }
+
+    #[test]
+    fn idle_and_background_intervals_are_clamped() {
+        let mut performance = PerformanceSettings::default();
+        assert_eq!(performance.idle_millis(), 66);
+        performance.idle_frame_rate = 1;
+        assert_eq!(performance.idle_millis(), 500);
+        performance.idle_frame_rate = 0;
+        assert_eq!(performance.idle_millis(), 500);
+        performance.idle_frame_rate = 1000;
+        assert_eq!(performance.idle_millis(), 8);
+
+        assert_eq!(performance.background_millis(), 33);
+        performance.background_frame_rate = 1;
+        assert_eq!(performance.background_millis(), 66);
+        performance.background_frame_rate = 1000;
+        assert_eq!(performance.background_millis(), 8);
+    }
+
+    #[test]
+    fn large_lyrics_defaults_are_independent_from_the_small_panel() {
+        let lyrics = LyricsSettings::default();
+        let large = LargeLyricsSettings::default();
+        assert!(large.font_size > lyrics.font_size);
+        assert!(large.show_cover);
+        assert!(large.show_title);
+        assert!(large.show_footer);
+    }
+
+    #[test]
+    fn settings_round_trip_preserves_new_fields() {
+        let mut settings = Settings::default();
+        settings.theme.ui_scale = 1.25;
+        settings.theme.gpu_power = GpuPowerPreference::HighPerformance;
+        settings.playback.crossfade_secs = 3.5;
+        settings.playback.speed = 1.25;
+        settings.mini.visible = true;
+        settings.mini.native_window = false;
+        settings.window.allow_multiple_instances = true;
+        settings.window.lyrics_monitor = Some(1);
+        settings.visualizer.enabled = true;
+        settings.visualizer.mode = VisualizerMode::Bars;
+
+        let text = serde_json::to_string(&settings).expect("serialize settings");
+        let restored: Settings = serde_json::from_str(&text).expect("deserialize settings");
+        assert!((restored.theme.ui_scale - 1.25).abs() < 1e-6);
+        assert!((restored.playback.crossfade_secs - 3.5).abs() < 1e-6);
+        assert!((restored.playback.speed - 1.25).abs() < 1e-6);
+        assert!(restored.mini.visible);
+        assert!(!restored.mini.native_window);
+        assert_eq!(
+            restored.theme.gpu_power,
+            GpuPowerPreference::HighPerformance
+        );
+        assert!(restored.window.allow_multiple_instances);
+        assert_eq!(restored.window.lyrics_monitor, Some(1));
+        assert!(restored.visualizer.enabled);
+        assert_eq!(restored.visualizer.mode, VisualizerMode::Bars);
+    }
+
+    #[test]
+    fn migrate_clamps_values_and_removes_legacy_sources() {
+        let mut settings = Settings::default();
+        settings.version = 0;
+        settings.theme.ui_scale = 9.0;
+        settings.playback.speed = 0.0;
+        settings.playback.volume = 2.0;
+        settings.radio.stations.push(RadioStation {
+            name: "Old".to_string(),
+            url: "https://example.invalid/stream".to_string(),
+            genre: String::new(),
+        });
+        let mut legacy = SourceConfig::preset(SourceKind::Online);
+        legacy.id = "kuwo".to_string();
+        settings.sources.push(legacy);
+
+        settings.migrate();
+
+        assert_eq!(settings.version, CONFIG_VERSION);
+        assert!((settings.theme.ui_scale - 1.6).abs() < 1e-6);
+        assert!((settings.playback.speed - 1.0).abs() < 1e-6);
+        assert!((settings.playback.volume - 1.0).abs() < 1e-6);
+        assert!(settings.radio.stations.is_empty());
+        assert!(!settings.sources.iter().any(|source| source.id == "kuwo"));
+        assert!(
+            settings
+                .sources
+                .iter()
+                .any(|source| source.kind == SourceKind::Local)
+        );
+        assert!(settings.sources.iter().any(|source| source.id == "online"));
+    }
+
+    #[test]
+    fn load_settings_returns_defaults_for_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let settings = load_settings(&path);
+        assert_eq!(settings.version, CONFIG_VERSION);
+        assert!(!settings.sources.is_empty());
+    }
+
+    #[test]
+    fn atomic_writes_replace_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.playback.volume = 0.25;
+        save_settings(&path, &settings).unwrap();
+        settings.playback.volume = 0.75;
+        save_settings(&path, &settings).unwrap();
+
+        let restored = load_settings(&path);
+        assert!((restored.playback.volume - 0.75).abs() < 1e-6);
+        assert!(
+            !path
+                .with_extension(format!("json.{}.tmp", std::process::id()))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn session_round_trip_keeps_station_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut first = Track::local("C:/music/first.mp3");
+        first.title = "First".to_string();
+        let mut second = Track::local("C:/music/second.mp3");
+        second.title = "Second".to_string();
+        let session = Session {
+            station: true,
+            lyrics_window: true,
+            lyrics_window_windowed: true,
+            station_history: vec![second.clone(), first.clone()],
+            recent_files: vec![RecentFile {
+                path: first.source.path().unwrap().to_path_buf(),
+                title: "First".to_string(),
+            }],
+            current_key: Some(second.dedupe_key()),
+            ..Session::default()
+        };
+        save_session(&path, &session).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let restored: Session = serde_json::from_str(&raw).unwrap();
+        assert!(restored.station);
+        assert!(restored.lyrics_window);
+        assert!(restored.lyrics_window_windowed);
+        assert_eq!(restored.station_history.len(), 2);
+        assert_eq!(restored.station_history[0].title, "Second");
+        assert_eq!(restored.recent_files.len(), 1);
+        assert_eq!(restored.recent_files[0].title, "First");
+        assert_eq!(
+            restored.current_key.as_deref(),
+            Some(second.dedupe_key().as_str())
+        );
+    }
+
+    #[test]
+    fn saved_playlists_dedupe_and_keep_newest_first() {
+        let mut session = Session::default();
+        session.remember_playlist(PathBuf::from("C:/music/one.mp3list"), 10);
+        session.remember_playlist(PathBuf::from("C:/music/two.m3u"), 20);
+        session.remember_playlist(PathBuf::from("C:/Music/ONE.mp3list"), 30);
+        assert_eq!(
+            session.playlists.len(),
+            2,
+            "path comparison is case-insensitive"
+        );
+        assert_eq!(
+            session.playlists[0].path,
+            PathBuf::from("C:/Music/ONE.mp3list")
+        );
+        assert_eq!(session.playlists[0].name, "ONE");
+        assert_eq!(session.playlists[0].last_opened, 30);
+        assert!(!session.forget_playlist(Path::new("C:/music/missing.mp3list")));
+        assert!(session.forget_playlist(Path::new("C:/music/two.m3u")));
+        assert_eq!(session.playlists.len(), 1);
+        assert!(session.has_playlist(Path::new("C:/music/one.mp3list")));
+    }
+
+    #[test]
+    fn saved_playlists_are_capped_and_persisted() {
+        let mut session = Session::default();
+        for index in 0..(MAX_SAVED_PLAYLISTS + 5) {
+            session.remember_playlist(
+                PathBuf::from(format!("C:/music/list-{index}.mp3list")),
+                index as u64,
+            );
+        }
+        assert_eq!(session.playlists.len(), MAX_SAVED_PLAYLISTS);
+        assert_eq!(
+            session.playlists[0].name,
+            format!("list-{}", MAX_SAVED_PLAYLISTS + 4)
+        );
+
+        let raw = serde_json::to_string(&session).unwrap();
+        let restored: Session = serde_json::from_str(&raw).unwrap();
+        assert_eq!(restored.playlists.len(), MAX_SAVED_PLAYLISTS);
+        let newest = MAX_SAVED_PLAYLISTS + 4;
+        assert_eq!(
+            restored.playlists[0].display_name(),
+            format!("list-{newest}")
+        );
+        assert_eq!(restored.playlists[0].last_opened, newest as u64);
+    }
 }

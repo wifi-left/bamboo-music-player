@@ -1,12 +1,11 @@
 //! System tray icon and menu.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{Receiver, unbounded};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{
-    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent, Icon,
-};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::config::Language;
 use crate::i18n::t;
@@ -37,10 +36,17 @@ pub struct Tray {
     lock_item: CheckMenuItem,
     actions: Receiver<TrayAction>,
     lang: Language,
+    quit: Arc<AtomicBool>,
 }
 
 impl Tray {
-    pub fn new(ctx: egui::Context, lang: Language, accent: [u8; 3]) -> anyhow::Result<Self> {
+    pub fn new(
+        ctx: egui::Context,
+        lang: Language,
+        accent: [u8; 3],
+        hwnd: isize,
+        quit_request: Arc<AtomicBool>,
+    ) -> anyhow::Result<Self> {
         let menu = Menu::new();
 
         let show = MenuItem::with_id("show", t(lang, "tray.show"), true, None);
@@ -48,30 +54,15 @@ impl Tray {
         let play = MenuItem::with_id("play", t(lang, "tray.play_pause"), true, None);
         let prev = MenuItem::with_id("prev", t(lang, "tray.prev"), true, None);
         let next = MenuItem::with_id("next", t(lang, "tray.next"), true, None);
-        let desktop = CheckMenuItem::with_id(
-            "desktop",
-            t(lang, "tray.desktop_lyrics"),
-            true,
-            false,
-            None,
-        );
-        let lock = CheckMenuItem::with_id(
-            "lock",
-            t(lang, "tray.lock_lyrics"),
-            true,
-            false,
-            None,
-        );
+        let desktop =
+            CheckMenuItem::with_id("desktop", t(lang, "tray.desktop_lyrics"), true, false, None);
+        let lock = CheckMenuItem::with_id("lock", t(lang, "tray.lock_lyrics"), true, false, None);
         let shuffle = CheckMenuItem::with_id("shuffle", t(lang, "tray.shuffle"), true, false, None);
         let repeat = MenuItem::with_id("repeat", t(lang, "tray.repeat"), true, None);
         let volume = Submenu::with_id("volume", t(lang, "tray.volume"), true);
         for percent in [0, 25, 50, 75, 100] {
-            let item = MenuItem::with_id(
-                format!("vol_{percent}"),
-                format!("{percent}%"),
-                true,
-                None,
-            );
+            let item =
+                MenuItem::with_id(format!("vol_{percent}"), format!("{percent}%"), true, None);
             volume.append(&item)?;
         }
         let quit = MenuItem::with_id("quit", t(lang, "tray.exit"), true, None);
@@ -102,38 +93,54 @@ impl Tray {
 
         let (tx, rx) = unbounded();
         let ctx = ctx.clone();
+        let quit_thread = quit_request.clone();
         std::thread::Builder::new()
             .name("bamboo-tray".to_string())
             .spawn(move || {
                 loop {
+                    // Block until the OS posts a tray/menu event instead of
+                    // polling every 80 ms; an idle tray now costs no wake-ups.
                     let mut fired = false;
-                    while let Ok(event) = MenuEvent::receiver().try_recv() {
-                        if let Some(action) = map_menu(&event.id.0) {
-                            let _ = tx.send(action);
-                            fired = true;
-                        }
-                    }
-                    while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                        match event {
-                            TrayIconEvent::Click {
-                                button: MouseButton::Left,
-                                button_state: MouseButtonState::Up,
-                                ..
-                            } => {
-                                let _ = tx.send(TrayAction::ToggleWindow);
-                                fired = true;
+                    crossbeam_channel::select! {
+                        recv(MenuEvent::receiver()) -> event => match event {
+                            Ok(event) => {
+                                if let Some(action) = map_menu(&event.id.0) {
+                                    if matches!(action, TrayAction::Quit) {
+                                        // A hidden/unfocused main window may not
+                                        // receive the repaint wake-up promptly.
+                                        // Deliver a real WM_CLOSE so winit runs
+                                        // the close path immediately.
+                                        quit_thread.store(true, Ordering::Relaxed);
+                                        crate::platform::window::post_close(hwnd);
+                                    }
+                                    let _ = tx.send(action);
+                                    fired = true;
+                                }
                             }
-                            TrayIconEvent::DoubleClick { .. } => {
-                                let _ = tx.send(TrayAction::PlayPause);
-                                fired = true;
-                            }
-                            _ => {}
-                        }
+                            Err(_) => break,
+                        },
+                        recv(TrayIconEvent::receiver()) -> event => match event {
+                            Ok(event) => match event {
+                                TrayIconEvent::Click {
+                                    button: MouseButton::Left,
+                                    button_state: MouseButtonState::Up,
+                                    ..
+                                } => {
+                                    let _ = tx.send(TrayAction::ToggleWindow);
+                                    fired = true;
+                                }
+                                // A double click intentionally does nothing:
+                                // it produced two click events plus an
+                                // unexpected play/pause toggle before.
+                                TrayIconEvent::DoubleClick { .. } => {}
+                                _ => {}
+                            },
+                            Err(_) => break,
+                        },
                     }
                     if fired {
                         ctx.request_repaint();
                     }
-                    std::thread::sleep(Duration::from_millis(80));
                 }
             })
             .ok();
@@ -147,6 +154,7 @@ impl Tray {
             lock_item: lock,
             actions: rx,
             lang,
+            quit: quit_request,
         })
     }
 
@@ -158,11 +166,24 @@ impl Tray {
         out
     }
 
+    /// True once the tray Quit item has posted its close request.
+    pub fn take_quit_request(&self) -> bool {
+        self.quit.swap(false, Ordering::Relaxed)
+    }
+
     pub fn set_playing(&self, playing: bool) {
         self.play_item.set_text(if playing {
-            format!("{} / {}", t(self.lang, "player.pause"), t(self.lang, "tray.play_pause"))
+            format!(
+                "{} / {}",
+                t(self.lang, "player.pause"),
+                t(self.lang, "tray.play_pause")
+            )
         } else {
-            format!("{} / {}", t(self.lang, "player.play"), t(self.lang, "tray.play_pause"))
+            format!(
+                "{} / {}",
+                t(self.lang, "player.play"),
+                t(self.lang, "tray.play_pause")
+            )
         });
     }
 
@@ -180,11 +201,8 @@ impl Tray {
             RepeatMode::All => t(self.lang, "player.repeat"),
             RepeatMode::One => "1",
         };
-        self.repeat_item.set_text(format!(
-            "{}: {}",
-            t(self.lang, "tray.repeat"),
-            label
-        ));
+        self.repeat_item
+            .set_text(format!("{}: {}", t(self.lang, "tray.repeat"), label));
     }
 
     pub fn set_desktop_lyrics(&self, on: bool) {

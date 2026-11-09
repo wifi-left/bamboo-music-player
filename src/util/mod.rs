@@ -1,8 +1,10 @@
 //! Small shared helpers.
 
+pub mod cover;
 pub mod icon;
 pub mod image_util;
 pub mod metadata;
+pub mod share_image;
 
 use std::path::Path;
 
@@ -50,6 +52,23 @@ pub fn open_in_explorer(path: &Path) {
     }
 }
 
+/// Reveal a file in Explorer and select it (`explorer /select,"path"`).
+pub fn reveal_in_explorer(path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = path.parent() {
+            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn open_url(url: &str) {
     let _ = webbrowser::open(url);
 }

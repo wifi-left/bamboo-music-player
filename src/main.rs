@@ -1,14 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! Bamboo Music Player
+//!
+//! Copyright (c) 2026 wifi-left. Licensed under the Bamboo Music Player
+//! Non-Commercial License 1.0 (see LICENSE): non-commercial use only, with
+//! attribution to the original author required.
 
+mod api;
 mod app;
 mod audio;
 mod config;
+mod desktop_overlay;
+mod download;
 mod i18n;
 mod library;
 mod lyrics;
+mod mini_overlay;
 mod model;
+mod overlay_protocol;
 mod platform;
 mod playlist;
+mod radio;
 mod util;
 
 use std::path::PathBuf;
@@ -19,26 +30,58 @@ use config::Paths;
 use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() -> eframe::Result {
-    let paths = Paths::discover();
-    init_logging(&paths);
-    tracing::info!(
-        "Bamboo Music Player {} starting (portable={}, data={})",
-        env!("CARGO_PKG_VERSION"),
-        paths.portable,
-        paths.root.display()
-    );
-
-    if platform::single_instance::already_running() {
-        tracing::info!("another instance is running; focusing it");
-        platform::window::focus_existing_instance("Bamboo Music Player");
-        return Ok(());
+    // Give the media flyout / taskbar a stable identity instead of "未知应用".
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+        use windows::core::PCWSTR;
+        let aumid: Vec<u16> = platform::APP_USER_MODEL_ID
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR(aumid.as_ptr()));
     }
 
+    let paths = Paths::discover();
+    // Settings must be read before the single-instance check: the user can
+    // opt into running multiple windows from the window settings.
     let (settings, session) = app::default_settings_and_session(&paths);
+    init_logging(&paths, settings.window.allow_multiple_instances);
+    tracing::info!(
+        "Bamboo Music Player {} starting (portable={}, data={}, multi_instance={})",
+        env!("CARGO_PKG_VERSION"),
+        paths.portable,
+        paths.root.display(),
+        settings.window.allow_multiple_instances
+    );
+
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if !settings.window.allow_multiple_instances && platform::single_instance::already_running() {
+        // With no file/command, ask the running instance to show itself. The
+        // pipe request also brings the window forward when it opens a file.
+        let mut forwarded_args = raw_args.clone();
+        if forwarded_args.is_empty() {
+            forwarded_args.push(std::ffi::OsString::from("--show"));
+        }
+        let forwarded = platform::ipc::send_to_existing(&forwarded_args);
+        tracing::info!("another instance is running; forwarded_args={forwarded}");
+        if !forwarded {
+            platform::window::focus_existing_instance("Bamboo Music Player");
+        }
+        return Ok(());
+    }
     let startup_args: Vec<PathBuf> = std::env::args_os()
         .skip(1)
         .map(PathBuf::from)
         .filter(|p| p.exists())
+        .collect();
+    // Commands (--play-pause, --next, …) also apply when this process is the
+    // one that starts the player, e.g. from a jump-list task.
+    let startup_commands: Vec<String> = raw_args
+        .iter()
+        .filter_map(|arg| arg.to_str())
+        .filter(|arg| arg.starts_with("--"))
+        .map(str::to_string)
         .collect();
     tracing::info!("startup args: {:?}", startup_args);
     let accent = settings.theme.accent;
@@ -78,6 +121,11 @@ fn main() -> eframe::Result {
         .with_app_id("bamboo-player")
         .with_inner_size([width, height])
         .with_min_inner_size([900.0, 560.0])
+        // Only Mica needs a transparent surface. Requesting it for every
+        // background made DWM composite a full-size transparent window even
+        // when the app painted an opaque background, which was a large fixed
+        // GPU cost on laptops.
+        .with_transparent(settings.theme.background == config::BackgroundMode::Mica)
         .with_icon(Arc::new(app::app_icon(accent)));
     let has_position = position.is_some();
     if let Some((x, y)) = position {
@@ -98,7 +146,18 @@ fn main() -> eframe::Result {
                 config::WgpuBackend::Vulkan => eframe::wgpu::Backends::VULKAN,
                 config::WgpuBackend::Gl => eframe::wgpu::Backends::GL,
             });
-        setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
+        setup.power_preference = match settings.theme.gpu_power {
+            config::GpuPowerPreference::Auto => eframe::wgpu::PowerPreference::None,
+            config::GpuPowerPreference::LowPower => eframe::wgpu::PowerPreference::LowPower,
+            config::GpuPowerPreference::HighPerformance => {
+                eframe::wgpu::PowerPreference::HighPerformance
+            }
+        };
+        tracing::info!(
+            "wgpu preference: backend={:?} power={:?}",
+            settings.theme.backend,
+            setup.power_preference
+        );
         setup.device_descriptor = Arc::new(|adapter| {
             let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
                 eframe::wgpu::Limits::downlevel_webgl2_defaults()
@@ -137,14 +196,22 @@ fn main() -> eframe::Result {
                 session,
                 paths,
                 startup_args,
+                startup_commands,
             )))
         }),
     )
 }
 
-fn init_logging(paths: &Paths) {
+fn init_logging(paths: &Paths, per_process: bool) {
     static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
-    let file_appender = tracing_appender::rolling::daily(&paths.logs, "bamboo.log");
+    // Multiple instances cannot share one rolling file safely; give each
+    // process its own prefix when the user enables that mode.
+    let prefix = if per_process {
+        format!("bamboo.{}.log", std::process::id())
+    } else {
+        "bamboo.log".to_string()
+    };
+    let file_appender = tracing_appender::rolling::daily(&paths.logs, prefix);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let _ = GUARD.set(guard);
 
@@ -155,7 +222,11 @@ fn init_logging(paths: &Paths) {
     };
     let filter = tracing_subscriber::EnvFilter::new(format!(
         "warn,bamboo_player={}",
-        if cfg!(debug_assertions) { "debug" } else { "info" }
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "info"
+        }
     ));
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
@@ -166,9 +237,42 @@ fn init_logging(paths: &Paths) {
         .init();
     let _ = level;
 
+    // eframe/egui-wgpu log through the `log` crate. Forward warnings/errors and
+    // notice when the swapchain rejects transparency, which is the signal that
+    // the DWM Mica backdrop cannot be shown.
+    let _ = log::set_logger(&LOG_BRIDGE);
+    log::set_max_level(log::LevelFilter::Info);
+
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic: {info}");
         default_hook(info);
     }));
+}
+
+struct LogBridge;
+
+static LOG_BRIDGE: LogBridge = LogBridge;
+
+impl log::Log for LogBridge {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        let message = record.args().to_string();
+        if record.level() > log::Level::Warn {
+            return;
+        }
+        if message.contains("Transparent window was requested") {
+            platform::window::note_transparency_unsupported();
+        }
+        match record.level() {
+            log::Level::Error => tracing::error!("[{}] {message}", record.target()),
+            log::Level::Warn => tracing::warn!("[{}] {message}", record.target()),
+            _ => {}
+        }
+    }
+
+    fn flush(&self) {}
 }

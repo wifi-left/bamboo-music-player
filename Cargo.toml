@@ -2,18 +2,24 @@
 name = "bamboo-player"
 version = "0.1.0"
 edition = "2024"
+authors = ["wifi-left"]
+license-file = "LICENSE"
+description = "Bamboo Music Player — a non-commercial native desktop music player"
 
 [dependencies]
+aes = "0.8.4"
 anyhow = "1.0.104"
+base64 = "0.22"
 biquad = "0.6.0"
 blake3 = "1.8.7"
+bytemuck = { version = "1.24", features = ["derive"] }
 chardetng = "1.0.0"
 chrono = "0.4.45"
 cpal = "0.18.2"
 crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
 ebur128 = "0.1.11"
-eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "persistence", "default_fonts"] }
+eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "persistence", "default_fonts", "accesskit"] }
 egui = "0.35"
 egui-phosphor = "0.13"
 egui-wgpu = "0.35"
@@ -24,8 +30,10 @@ global-hotkey = "0.9.0"
 ico = "0.6.0"
 image = { version = "0.25.10", features = ["jpeg", "png", "webp"] }
 lofty = "0.25.5"
+log = "0.4.28"
 memmap2 = "0.9.12"
 muda = "0.21.2"
+notify = "8.2.1"
 parking_lot = "0.12.5"
 rand = "0.10.3"
 raw-window-handle = "0.6"
@@ -47,12 +55,17 @@ ureq = { version = "3.5.1", features = ["native-tls", "json", "cookies", "win-sy
 url = "2.5.8"
 walkdir = "2.5.0"
 webbrowser = "1.2.6"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Media_Audio", "Foundation", "Foundation_Collections", "Media", "Storage_Streams", "Graphics_Imaging", "UI_Notifications", "Win32_Security", "Win32_System_ProcessStatus", "Win32_System_Memory", "Win32_UI_HiDpi"] }
+windows-future = "0.3.2"
+windows-numerics = "0.3.1"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Pipes", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_System_Com", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Media_Audio", "Foundation", "Foundation_Collections", "Media", "Storage_Streams", "Graphics_Imaging", "UI_Notifications", "Data_Xml_Dom", "Win32_Security", "Win32_System_ProcessStatus", "Win32_System_Memory", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_System_WinRT"] }
 
 [dev-dependencies]
 hound = "3.5.1"
 pretty_assertions = "1.4.1"
 tempfile = "3.27.0"
+# Validates the inline WGSL background shader without needing a GPU adapter.
+naga = { version = "29.0.4", features = ["wgsl-in"] }
+pollster = "0.4.0"
 
 [profile.release]
 opt-level = 3

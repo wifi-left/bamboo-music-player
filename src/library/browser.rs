@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::util::is_audio_file;
 
@@ -23,7 +23,6 @@ pub struct FolderBrowser {
     pub loading: bool,
     pub error: Option<String>,
     pub truncated: bool,
-    pub history: Vec<PathBuf>,
 }
 
 struct Request {

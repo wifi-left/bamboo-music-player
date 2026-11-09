@@ -1,8 +1,7 @@
 //! Process memory inspection and optional working-set trimming.
 
 use windows::Win32::System::ProcessStatus::{
-    EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    PROCESS_MEMORY_COUNTERS_EX,
+    EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -10,7 +9,6 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 pub struct MemoryInfo {
     pub working_set: u64,
     pub private_usage: u64,
-    pub peak_working_set: u64,
 }
 
 pub fn process_memory() -> Option<MemoryInfo> {
@@ -29,7 +27,6 @@ pub fn process_memory() -> Option<MemoryInfo> {
     Some(MemoryInfo {
         working_set: counters.WorkingSetSize as u64,
         private_usage: counters.PrivateUsage as u64,
-        peak_working_set: counters.PeakWorkingSetSize as u64,
     })
 }
 

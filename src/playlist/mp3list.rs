@@ -4,14 +4,22 @@
 //! since the last open are reflected. Queue keys (not indices) are used to
 //! restore the previous track and position.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::model::{Track, TrackSource, normalize_path};
 
+/// A `#SEARCH#`/`#SEARCHA#` directory plus its optional `#type#` filter.
+#[derive(Debug, Clone)]
+pub struct PlaylistDir {
+    pub path: PathBuf,
+    /// Empty means the application's default audio extension list.
+    pub extensions: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct ParsedPlaylist {
-    pub dirs: Vec<PathBuf>,
+    pub dirs: Vec<PlaylistDir>,
     pub files: Vec<PathBuf>,
     pub urls: Vec<String>,
     pub online: Vec<Track>,
@@ -21,39 +29,63 @@ pub struct ParsedPlaylist {
 
 pub fn parse(path: &Path) -> Result<ParsedPlaylist, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("无法读取歌单: {e}"))?;
-    let (text, encoding) = decode_text(&bytes);
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let base = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let (text, encoding) = decode_best(&bytes, &base);
     let mut out = ParsedPlaylist {
         encoding,
         ..Default::default()
     };
-    let mut seen = HashSet::new();
+    let mut seen_files = HashSet::new();
+    let mut seen_urls = HashSet::new();
+    let mut seen_online = HashSet::new();
+    let mut dir_index: HashMap<String, usize> = HashMap::new();
 
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        let upper = line.to_ascii_uppercase();
-        if upper.starts_with("#SEARCH#") {
-            let raw_path = &line[8..];
+        if let Some((raw_path, type_filter)) = parse_search_line(line) {
             let value = expand_env(strip_quotes(raw_path.trim()));
             if value.is_empty() {
                 continue;
             }
-            let dir = resolve_path(base, &value);
+            let dir = resolve_path(&base, &value);
             if !dir.is_dir() {
                 out.missing += 1;
                 continue;
             }
-            if seen.insert(normalize_path(&dir)) {
-                out.dirs.push(dir);
+            let extensions = type_filter.map(parse_type_filter).unwrap_or_default();
+            let key = normalize_path(&dir);
+            if let Some(&index) = dir_index.get(&key) {
+                let existing = &mut out.dirs[index];
+                if existing.extensions.is_empty() {
+                    // Already unfiltered; keep it that way.
+                } else if extensions.is_empty() {
+                    existing.extensions.clear();
+                } else {
+                    for ext in extensions {
+                        if !existing.extensions.contains(&ext) {
+                            existing.extensions.push(ext);
+                        }
+                    }
+                }
+            } else {
+                dir_index.insert(key, out.dirs.len());
+                out.dirs.push(PlaylistDir {
+                    path: dir,
+                    extensions,
+                });
             }
             continue;
         }
+        let upper = line.to_ascii_uppercase();
         if upper.starts_with("#BAMBOO#") {
             if let Some(track) = parse_bamboo(&line[8..]) {
-                if seen.insert(track.dedupe_key()) {
+                if seen_online.insert(track.dedupe_key()) {
                     out.online.push(track);
                 }
             }
@@ -67,7 +99,7 @@ pub fn parse(path: &Path) -> Result<ParsedPlaylist, String> {
             continue;
         }
         if value.starts_with("http://") || value.starts_with("https://") {
-            if seen.insert(format!("url:{}", value.trim())) {
+            if seen_urls.insert(value.trim().to_string()) {
                 out.urls.push(value);
             }
             continue;
@@ -75,24 +107,73 @@ pub fn parse(path: &Path) -> Result<ParsedPlaylist, String> {
         if value.starts_with("file://") {
             if let Ok(url) = url::Url::parse(&value) {
                 if let Ok(path) = url.to_file_path() {
-                    if seen.insert(normalize_path(&path)) {
+                    if seen_files.insert(normalize_path(&path)) {
                         out.files.push(path);
                     }
                 }
             }
             continue;
         }
-        let file = resolve_path(base, &value);
+        let file = resolve_path(&base, &value);
         if !file.is_file() {
             out.missing += 1;
             continue;
         }
-        if seen.insert(normalize_path(&file)) {
+        if seen_files.insert(normalize_path(&file)) {
             out.files.push(file);
         }
     }
 
     Ok(out)
+}
+
+/// Parse the real-world `#SEARCHA#<dir>#type#*.mp3` form as well as the
+/// documented `#SEARCH#<dir>` form.
+fn parse_search_line(line: &str) -> Option<(&str, Option<&str>)> {
+    let upper = line.to_ascii_uppercase();
+    if !upper.starts_with("#SEARCH") {
+        return None;
+    }
+    if line.len() < 8 {
+        return None;
+    }
+    // Skip "#SEARCH" and any suffix letters ("A", "B", ...), then the '#'.
+    let rest = &line[7..];
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let rest = rest.strip_prefix('#')?;
+    let lower = rest.to_ascii_lowercase();
+    if let Some(pos) = lower.find("#type#") {
+        let path = rest[..pos].trim();
+        let filter = rest[pos + 6..].trim();
+        Some((path, Some(filter)))
+    } else {
+        Some((rest.trim(), None))
+    }
+}
+
+/// `#type#*.mp3;*.flac` -> `["mp3", "flac"]`. `*` / `*.*` means all supported
+/// audio formats, represented by an empty list.
+fn parse_type_filter(filter: &str) -> Vec<String> {
+    let mut extensions = Vec::new();
+    for part in filter.split([';', ',', '|', ' ']) {
+        let part = part.trim().trim_matches('"').to_ascii_lowercase();
+        if part.is_empty() {
+            continue;
+        }
+        if part == "*" || part == "*.*" {
+            return Vec::new();
+        }
+        let ext = part
+            .strip_prefix("*.")
+            .or_else(|| part.strip_prefix('.'))
+            .unwrap_or(&part);
+        if !ext.is_empty() && !ext.contains(['*', '?']) {
+            if !extensions.iter().any(|e| e == ext) {
+                extensions.push(ext.to_string());
+            }
+        }
+    }
+    extensions
 }
 
 /// Export the current queue in `.mp3list` form (UTF-8, optional BOM).
@@ -215,11 +296,17 @@ fn expand_env(value: &str) -> String {
     out
 }
 
-fn decode_text(bytes: &[u8]) -> (String, String) {
-    use encoding_rs::{GB18030, UTF_16BE, UTF_16LE, UTF_8};
+/// Decode a playlist that may be UTF-8 (with or without BOM) or a legacy
+/// Chinese/Japanese code page. Several candidates are scored so a GBK file
+/// containing Japanese folder names is not misdetected as Shift-JIS.
+fn decode_best(bytes: &[u8], base: &Path) -> (String, String) {
+    use encoding_rs::{BIG5, GB18030, SHIFT_JIS, UTF_8, UTF_16BE, UTF_16LE};
 
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return (UTF_8.decode(&bytes[3..]).0.into_owned(), "UTF-8 BOM".to_string());
+        return (
+            UTF_8.decode(&bytes[3..]).0.into_owned(),
+            "UTF-8 BOM".to_string(),
+        );
     }
     if bytes.starts_with(&[0xFF, 0xFE]) {
         return (
@@ -237,18 +324,88 @@ fn decode_text(bytes: &[u8]) -> (String, String) {
         return (text.to_string(), "UTF-8".to_string());
     }
 
-    let mut detector = chardetng::EncodingDetector::new(
-        chardetng::Iso2022JpDetection::Deny,
-    );
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(bytes, true);
-    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
-    let (text, _, _) = encoding.decode(bytes);
-    let name = encoding.name().to_string();
-    if text.contains('\u{FFFD}') {
-        let (fallback, _, _) = GB18030.decode(bytes);
-        return (fallback.into_owned(), "GB18030".to_string());
+    let detected = detector.guess(None, chardetng::Utf8Detection::Allow);
+
+    let mut candidates: Vec<&'static encoding_rs::Encoding> = vec![detected];
+    for encoding in [GB18030, BIG5, SHIFT_JIS] {
+        if !candidates.iter().any(|e| e.name() == encoding.name()) {
+            candidates.push(encoding);
+        }
     }
-    (text.into_owned(), name)
+
+    let mut best: Option<((i32, i32, i32), String, String)> = None;
+    for (order, encoding) in candidates.into_iter().enumerate() {
+        let (text, _, had_errors) = encoding.decode(bytes);
+        let text = text.into_owned();
+        let replacements = text.matches('\u{FFFD}').count() as i32 + i32::from(had_errors);
+        let score = candidate_score(&text, base);
+        // Higher score, fewer replacement characters, earlier preference.
+        let rank = (score, -replacements, -(order as i32));
+        let name = encoding.name().to_string();
+        if best
+            .as_ref()
+            .map(|(current, _, _)| rank > *current)
+            .unwrap_or(true)
+        {
+            best = Some((rank, text, name));
+        }
+    }
+
+    match best {
+        Some((_, text, name)) => (text, name),
+        None => (
+            String::from_utf8_lossy(bytes).into_owned(),
+            "UTF-8 (lossy)".to_string(),
+        ),
+    }
+}
+
+/// Score a decoded candidate by how many referenced paths exist, then by how
+/// plausible the CJK characters look. GBK-misread-as-Shift-JIS text is full of
+/// half-width katakana and scores poorly.
+fn candidate_score(text: &str, base: &Path) -> i32 {
+    let mut score = 0i32;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((raw_path, _)) = parse_search_line(line) {
+            let value = expand_env(strip_quotes(raw_path.trim()));
+            if !value.is_empty() && resolve_path(base, &value).is_dir() {
+                score += 120;
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let value = expand_env(strip_quotes(line));
+        if value.is_empty()
+            || value.starts_with("http://")
+            || value.starts_with("https://")
+            || value.starts_with("file://")
+        {
+            continue;
+        }
+        if resolve_path(base, &value).is_file() {
+            score += 120;
+        }
+    }
+
+    for ch in text.chars() {
+        let code = ch as u32;
+        score += match code {
+            0x4E00..=0x9FFF => 2,  // CJK ideographs
+            0x3040..=0x30FF => 2,  // kana
+            0xFF61..=0xFF9F => -4, // half-width katakana (typical mojibake)
+            0xFFFD => -20,
+            _ => 0,
+        };
+    }
+    score
 }
 
 #[cfg(test)]
@@ -278,7 +435,9 @@ mod tests {
         .unwrap();
 
         let parsed = parse(&list).unwrap();
-        assert_eq!(parsed.dirs, vec![music]);
+        assert_eq!(parsed.dirs.len(), 1);
+        assert_eq!(parsed.dirs[0].path, music);
+        assert!(parsed.dirs[0].extensions.is_empty());
         assert_eq!(parsed.files, vec![other]);
         assert_eq!(parsed.urls, vec!["https://example.com/s.mp3"]);
         assert_eq!(parsed.online.len(), 1);
@@ -304,6 +463,91 @@ mod tests {
             parsed.encoding.to_lowercase().contains("gbk")
                 || parsed.encoding.to_lowercase().contains("gb18030")
         );
+    }
+
+    #[test]
+    fn parses_searcha_with_type_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let touhou = root.join("Touhou");
+        let other = root.join("other");
+        std::fs::create_dir_all(&touhou).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let list = root.join("searcha.mp3list");
+        std::fs::write(
+            &list,
+            format!(
+                "#SEARCHA#{}#type#*.mp3;*.flac\n#SEARCH#{}#type#*\n",
+                touhou.display(),
+                other.display()
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse(&list).unwrap();
+        assert_eq!(parsed.dirs.len(), 2);
+        assert_eq!(parsed.dirs[0].path, touhou);
+        assert_eq!(parsed.dirs[0].extensions, vec!["mp3", "flac"]);
+        assert!(parsed.dirs[1].extensions.is_empty());
+    }
+
+    #[test]
+    fn detects_gbk_with_japanese_and_chinese_names() {
+        use encoding_rs::GB18030;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let japanese = root.join("ししまいブラザーズ");
+        let chinese = root.join("狐尾草");
+        std::fs::create_dir_all(&japanese).unwrap();
+        std::fs::create_dir_all(&chinese).unwrap();
+        let list = root.join("legacy.mp3list");
+        let text = format!(
+            "#SEARCHA#{}#type#*.mp3\r\n#SEARCHA#{}#type#*.mp3\r\n",
+            japanese.display(),
+            chinese.display()
+        );
+        let (bytes, _, _) = GB18030.encode(&text);
+        std::fs::write(&list, bytes).unwrap();
+
+        let parsed = parse(&list).unwrap();
+        assert_eq!(parsed.dirs.len(), 2);
+        assert_eq!(parsed.dirs[0].path, japanese);
+        assert_eq!(parsed.dirs[1].path, chinese);
+        assert!(!parsed.encoding.to_lowercase().contains("shift"));
+    }
+
+    /// Validates the real `#SEARCHA#...#type#*.mp3` files the user keeps in
+    /// `E:\playlist`; silently skipped on machines without that folder.
+    #[test]
+    fn parses_real_example_playlists_if_present() {
+        let dir = Path::new("E:\\playlist");
+        if !dir.is_dir() {
+            return;
+        }
+        for name in ["ALL.mp3list", "Touhou.mp3list", "Touhou_vocal.mp3list"] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let parsed = parse(&path).unwrap();
+            assert!(
+                !parsed.dirs.is_empty(),
+                "{name} should contain #SEARCHA# directories"
+            );
+            assert!(
+                parsed.dirs.iter().all(|d| d.path.is_dir()),
+                "{name} paths should resolve"
+            );
+            assert!(
+                parsed.dirs.iter().any(|d| d.extensions == vec!["mp3"]),
+                "{name} should carry the #type#*.mp3 filter"
+            );
+            assert!(
+                !parsed.encoding.to_lowercase().contains("shift"),
+                "{name} is GBK, not Shift-JIS (got {})",
+                parsed.encoding
+            );
+        }
     }
 
     #[test]

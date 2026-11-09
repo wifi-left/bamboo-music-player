@@ -1,12 +1,139 @@
-//! Minimal embedded i18n. Chinese is the default; English mirrors the UI.
+//! Embedded i18n. Chinese is the default; English mirrors the UI.
+//!
+//! The application was written with Chinese literals at every call site. For
+//! those, [`tr`] translates by source text using the embedded `en.json` table;
+//! adding a pair there is enough to translate one label. [`t`] remains for
+//! older key-based lookups.
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::config::Language;
+
+static LANGUAGE: AtomicU8 = AtomicU8::new(0);
+
+static ENGLISH: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("en.json")).unwrap_or_else(|err| {
+        tracing::error!("invalid i18n/en.json: {err}");
+        HashMap::new()
+    })
+});
+
+/// Set the process-wide language used by [`tr`]. The tray and viewports do not
+/// carry an `App` reference, so a process-wide value keeps every surface in
+/// sync when the user switches language.
+pub fn set_language(lang: Language) {
+    LANGUAGE.store(
+        match lang {
+            Language::ZhCn => 0,
+            Language::EnUs => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn current_language() -> Language {
+    if LANGUAGE.load(Ordering::Relaxed) == 0 {
+        Language::ZhCn
+    } else {
+        Language::EnUs
+    }
+}
+
+/// Translate one source-text literal. In Chinese mode the input is returned
+/// unchanged; unknown strings fall back to the source text so missing entries
+/// never break the UI.
+pub fn tr(text: &'static str) -> &'static str {
+    tr_in(current_language(), text)
+}
+
+/// Language-explicit [`tr`]. Tests use this instead of mutating the
+/// process-wide language, which would race with other test threads.
+pub fn tr_in(lang: Language, text: &'static str) -> &'static str {
+    if lang == Language::ZhCn {
+        return text;
+    }
+    ENGLISH.get(text).map(String::as_str).unwrap_or(text)
+}
+
+/// Translate a runtime string such as a stored source name. Unknown strings
+/// (user-defined source names) are returned unchanged.
+pub fn tr_str(text: &str) -> &str {
+    if current_language() == Language::ZhCn {
+        return text;
+    }
+    ENGLISH.get(text).map(String::as_str).unwrap_or(text)
+}
 
 pub fn t(lang: Language, key: &'static str) -> &'static str {
     match lang {
         Language::ZhCn => zh(key),
         Language::EnUs => en(key),
     }
+}
+
+/// Translate and fill a Chinese format template with arguments in placeholder
+/// order. Named placeholders are filled positionally, so translations must
+/// keep the same order as the source template. Format specs are ignored.
+pub fn format_template(template: &'static str, args: &[&dyn std::fmt::Display]) -> String {
+    format_template_in(current_language(), template, args)
+}
+
+/// Language-explicit [`format_template`] for tests.
+pub fn format_template_in(
+    lang: Language,
+    template: &'static str,
+    args: &[&dyn std::fmt::Display],
+) -> String {
+    let template = tr_in(lang, template);
+    let mut out = String::with_capacity(template.len() + 12);
+    let mut chars = template.chars().peekable();
+    let mut arg_index = 0;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    out.push('{');
+                    continue;
+                }
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if closed {
+                    if let Some(arg) = args.get(arg_index) {
+                        out.push_str(&arg.to_string());
+                        arg_index += 1;
+                    }
+                } else {
+                    out.push('{');
+                }
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                }
+                out.push('}');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[macro_export]
+macro_rules! trf {
+    ($template:literal $(, $arg:expr)* $(,)?) => {
+        $crate::i18n::format_template(
+            $template,
+            &[$(&$arg as &dyn ::std::fmt::Display),*],
+        )
+    };
 }
 
 fn zh(key: &'static str) -> &'static str {
@@ -239,7 +366,9 @@ fn en(key: &'static str) -> &'static str {
         "player.play_next" => "Play next",
         "now.title" => "Now Playing",
         "now.no_lyrics" => "No lyrics",
-        "now.no_lyrics_hint" => "Place a matching .lrc / .srt next to the song, or adjust the lyric encoding in Settings",
+        "now.no_lyrics_hint" => {
+            "Place a matching .lrc / .srt next to the song, or adjust the lyric encoding in Settings"
+        }
         "now.source" => "Source",
         "now.format" => "Format",
         "now.quality" => "Quality",
@@ -319,7 +448,9 @@ fn en(key: &'static str) -> &'static str {
         "settings.always_on_top" => "Always on top",
         "settings.show_footer" => "Show now-playing footer",
         "settings.capture_protection" => "Exclude from screen capture",
-        "settings.capture_hint" => "Requires Windows 10 2004+; capture tools will not see this window",
+        "settings.capture_hint" => {
+            "Requires Windows 10 2004+; capture tools will not see this window"
+        }
         "settings.monitor" => "Monitor",
         "settings.bg_transparent" => "Transparent",
         "settings.bg_solid" => "Solid",
@@ -349,7 +480,9 @@ fn en(key: &'static str) -> &'static str {
         "settings.concurrency" => "Concurrency",
         "settings.embed_tags" => "Write tags",
         "settings.save_lyrics" => "Save lyrics",
-        "settings.features_hint" => "Every enhancement can be switched off; its UI and background work are removed with it.",
+        "settings.features_hint" => {
+            "Every enhancement can be switched off; its UI and background work are removed with it."
+        }
         "settings.reset" => "Reset settings",
         "settings.open_data_dir" => "Open data folder",
         "settings.log_dir" => "Open log folder",
@@ -392,5 +525,50 @@ fn en(key: &'static str) -> &'static str {
         "tray.exit" => "Exit",
         "tray.volume" => "Volume",
         _ => key,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_source_text_and_falls_back() {
+        assert_eq!(tr_in(Language::ZhCn, "播放"), "播放");
+        assert_eq!(tr_in(Language::EnUs, "播放"), "Play");
+        assert_eq!(tr_in(Language::EnUs, "设置"), "Settings");
+        assert_eq!(
+            tr_in(Language::EnUs, "没有翻译的字符串"),
+            "没有翻译的字符串"
+        );
+        assert_eq!(
+            format_template_in(Language::EnUs, "{} 首", &[&3 as &dyn std::fmt::Display]),
+            "3 tracks"
+        );
+        assert_eq!(
+            format_template_in(
+                Language::EnUs,
+                "第 {index} / {count} 行",
+                &[&2 as &dyn std::fmt::Display, &5]
+            ),
+            "Line 2 / 5"
+        );
+        assert_eq!(tr_in(Language::ZhCn, "设置"), "设置");
+        assert_eq!(
+            format_template_in(Language::ZhCn, "{} 首", &[&3 as &dyn std::fmt::Display]),
+            "3 首"
+        );
+    }
+
+    #[test]
+    fn every_wrapped_ui_literal_has_an_english_entry() {
+        // scripts/i18n_strings.json is generated by scripts/wrap_i18n.py.
+        let strings: Vec<String> =
+            serde_json::from_str(include_str!("../../scripts/i18n_strings.json")).unwrap();
+        let missing: Vec<&String> = strings
+            .iter()
+            .filter(|text| !ENGLISH.contains_key(text.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "missing translations: {missing:?}");
     }
 }

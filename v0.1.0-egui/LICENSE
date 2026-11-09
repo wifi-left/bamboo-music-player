@@ -1,0 +1,97 @@
+Bamboo Music Player Non-Commercial License
+Version 1.0
+Copyright (c) 2026 wifi-left. All rights reserved.
+
+This license applies to the Bamboo Music Player source code, binaries,
+assets, and documentation in this repository (the "Work"). It is a
+source-available license, not an open-source license: commercial use is
+prohibited unless the copyright holder grants prior written permission.
+
+1. GRANT OF RIGHTS
+
+Subject to the conditions in this license, the copyright holder grants you a
+worldwide, royalty-free, non-exclusive, non-transferable license to use, copy,
+modify, merge, publish, distribute, and sublicense the Work, solely for
+Non-Commercial Purposes. You may sublicense only under the same terms and
+conditions of this license.
+
+2. NON-COMMERCIAL RESTRICTION
+
+"Non-Commercial Purposes" means purposes that are not primarily intended for
+or directed toward commercial advantage or monetary compensation. Without the
+prior written permission of the copyright holder, you may not use, distribute,
+make available, or incorporate the Work (in whole or in part) into any product
+or service that is sold, licensed for a fee, monetized through advertising,
+subscriptions, donations tied to access, or otherwise commercially exploited.
+
+Internal evaluation or development by a commercial entity is permitted only
+if the resulting product or service is not distributed or made available for
+commercial advantage without a separate commercial license.
+
+3. ATTRIBUTION AND AUTHOR CREDIT
+
+Any use, reproduction, modification, distribution, or derivative work of the
+Work must:
+
+  (a) retain this license file and all copyright notices in the Work;
+
+  (b) give prominent credit to the original author, "wifi-left", and to the
+      project name, "Bamboo Music Player";
+
+  (c) state clearly that the Work is licensed under the Bamboo Music Player
+      Non-Commercial License 1.0 and include a copy of, or a link to, this
+      license;
+
+  (d) if you modify the Work, clearly indicate that changes were made and not
+      imply that the original author endorses the modifications.
+
+If the Work is distributed with a graphical user interface, the author and
+license notice must be reasonably visible in an "About", "Credits", or
+equivalent screen. Command-line or library distributions must include the
+notice in their documentation or accompanying files.
+
+4. NO TRADEMARK LICENSE
+
+This license does not grant permission to use the trade names, trademarks,
+service marks, or logos of "Bamboo Music Player" or "wifi-left", except as
+necessary to comply with the attribution requirements in Section 3 or to
+describe the origin of the Work.
+
+5. NO WARRANTY
+
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THE COPYRIGHT
+HOLDER DOES NOT WARRANT THAT THE WORK WILL BE ERROR-FREE OR UNINTERRUPTED.
+
+6. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS IN
+THE WORK.
+
+7. TERMINATION
+
+Your rights under this license terminate automatically if you breach any of
+its terms. Upon termination, you must stop using the Work and delete or
+disable all copies you control, except where retention is required by law.
+Sections 2 through 6 survive termination.
+
+8. ACCEPTANCE
+
+By using, copying, modifying, or distributing the Work, you accept and agree
+to the terms of this license.
+
+9. COMMERCIAL LICENSING AND PERMISSIONS
+
+For commercial licensing, exceptions, or other permissions, contact the
+copyright holder through the project repository. Any permission granted by the
+copyright holder must be in writing and applies only to the specific use
+described in that permission.
+
+10. THIRD-PARTY COMPONENTS
+
+This license applies only to the original Work. Third-party libraries,
+crates, fonts, icons, and other components remain under their own licenses.
+See Cargo.lock and the corresponding upstream projects for details.

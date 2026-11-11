@@ -1,0 +1,30 @@
+# Rust / Cargo build artifacts (any subproject)
+**/target/
+**/dist/
+*.pdb
+*.exe
+*.dll
+*.lib
+*.rlib
+*.rmeta
+
+# Test output, screenshots and scratch files
+**/test-output/
+**/tests-output/
+**/screenshots/
+**/captures/
+**/shot*.png
+**/test-*.png
+**/test_*.png
+*.part
+*.part.meta
+*.tmp
+*.log
+
+# Local tooling caches
+.zcode/
+__pycache__/
+*.pyc
+
+# DO NOT TRACK ref
+ref/

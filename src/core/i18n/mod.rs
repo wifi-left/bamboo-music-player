@@ -1,0 +1,572 @@
+//! Embedded i18n. Chinese is the default; English mirrors the UI.
+//!
+//! The application was written with Chinese literals at every call site. For
+//! those, [`tr`] translates by source text using the embedded `en.json` table;
+//! adding a pair there is enough to translate one label. [`t`] remains for
+//! older key-based lookups.
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::config::Language;
+
+static LANGUAGE: AtomicU8 = AtomicU8::new(0);
+
+static ENGLISH: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("en.json")).unwrap_or_else(|err| {
+        tracing::error!("invalid i18n/en.json: {err}");
+        HashMap::new()
+    })
+});
+
+/// Set the process-wide language used by [`tr`]. The tray and viewports do not
+/// carry an `App` reference, so a process-wide value keeps every surface in
+/// sync when the user switches language.
+pub fn set_language(lang: Language) {
+    LANGUAGE.store(
+        match lang {
+            Language::ZhCn => 0,
+            Language::EnUs => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn current_language() -> Language {
+    if LANGUAGE.load(Ordering::Relaxed) == 0 {
+        Language::ZhCn
+    } else {
+        Language::EnUs
+    }
+}
+
+/// Translate one source-text literal. In Chinese mode the input is returned
+/// unchanged; unknown strings fall back to the source text so missing entries
+/// never break the UI.
+pub fn tr(text: &'static str) -> &'static str {
+    tr_in(current_language(), text)
+}
+
+/// Language-explicit [`tr`]. Tests use this instead of mutating the
+/// process-wide language, which would race with other test threads.
+pub fn tr_in(lang: Language, text: &'static str) -> &'static str {
+    if lang == Language::ZhCn {
+        return text;
+    }
+    ENGLISH.get(text).map(String::as_str).unwrap_or(text)
+}
+
+/// Translate a runtime string such as a stored source name. Unknown strings
+/// (user-defined source names) are returned unchanged.
+pub fn tr_str(text: &str) -> &str {
+    if current_language() == Language::ZhCn {
+        return text;
+    }
+    ENGLISH.get(text).map(String::as_str).unwrap_or(text)
+}
+
+pub fn t(lang: Language, key: &'static str) -> &'static str {
+    match lang {
+        Language::ZhCn => zh(key),
+        Language::EnUs => en(key),
+    }
+}
+
+/// Translate and fill a Chinese format template with arguments in placeholder
+/// order. Named placeholders are filled positionally, so translations must
+/// keep the same order as the source template. Format specs are ignored.
+pub fn format_template(template: &'static str, args: &[&dyn std::fmt::Display]) -> String {
+    format_template_in(current_language(), template, args)
+}
+
+/// Language-explicit [`format_template`] for tests.
+pub fn format_template_in(
+    lang: Language,
+    template: &'static str,
+    args: &[&dyn std::fmt::Display],
+) -> String {
+    let template = tr_in(lang, template);
+    let mut out = String::with_capacity(template.len() + 12);
+    let mut chars = template.chars().peekable();
+    let mut arg_index = 0;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    out.push('{');
+                    continue;
+                }
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if closed {
+                    if let Some(arg) = args.get(arg_index) {
+                        out.push_str(&arg.to_string());
+                        arg_index += 1;
+                    }
+                } else {
+                    out.push('{');
+                }
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                }
+                out.push('}');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[macro_export]
+macro_rules! trf {
+    ($template:literal $(, $arg:expr)* $(,)?) => {
+        $crate::i18n::format_template(
+            $template,
+            &[$(&$arg as &dyn ::std::fmt::Display),*],
+        )
+    };
+}
+
+fn zh(key: &'static str) -> &'static str {
+    match key {
+        "app.name" => "Bamboo Music Player",
+        "app.tagline" => "性能 · 原生 · 好听",
+        "nav.now_playing" => "正在播放",
+        "nav.library" => "曲库",
+        "nav.playlists" => "歌单",
+        "nav.search" => "在线搜索",
+        "nav.discover" => "发现",
+        "nav.settings" => "设置",
+        "nav.playlists_section" => "我的歌单",
+        "nav.queue" => "播放队列",
+        "player.play" => "播放",
+        "player.pause" => "暂停",
+        "player.prev" => "上一首",
+        "player.next" => "下一首",
+        "player.stop" => "停止",
+        "player.shuffle" => "随机播放",
+        "player.shuffle_on" => "随机播放：开",
+        "player.repeat" => "循环模式",
+        "player.queue" => "播放队列",
+        "player.lyrics" => "歌词",
+        "player.desktop_lyrics" => "桌面歌词",
+        "player.volume" => "音量",
+        "player.mute" => "静音",
+        "player.unmute" => "取消静音",
+        "player.no_track" => "还没有正在播放的歌曲",
+        "player.no_track_hint" => "拖入音频文件，或从曲库/歌单中开始播放",
+        "player.open_files" => "打开文件",
+        "player.open_folder" => "打开文件夹",
+        "player.clear_queue" => "清空队列",
+        "player.remove" => "移出队列",
+        "player.play_now" => "立即播放",
+        "player.add_to_queue" => "加入队列",
+        "player.play_next" => "下一首播放",
+        "now.title" => "正在播放",
+        "now.no_lyrics" => "暂无歌词",
+        "now.no_lyrics_hint" => "将同名 .lrc / .srt 放在歌曲旁，或在设置中调整歌词编码",
+        "now.source" => "来源",
+        "now.format" => "格式",
+        "now.quality" => "品质",
+        "library.title" => "曲库",
+        "library.subtitle" => "扫描本地音乐，按歌曲、专辑、歌手或文件夹浏览",
+        "library.add_folder" => "添加音乐目录",
+        "library.scan" => "重新扫描",
+        "library.scanning" => "正在扫描…",
+        "library.empty" => "曲库还是空的",
+        "library.empty_hint" => "添加一个音乐目录，或把文件拖进窗口",
+        "library.songs" => "歌曲",
+        "library.albums" => "专辑",
+        "library.artists" => "歌手",
+        "library.folders" => "文件夹",
+        "library.play_all" => "播放全部",
+        "playlists.title" => "歌单",
+        "playlists.subtitle" => "导入 / 导出 .mp3list，支持目录与在线曲目",
+        "playlists.import" => "导入歌单",
+        "playlists.export" => "导出歌单",
+        "playlists.new" => "新建歌单",
+        "playlists.empty" => "还没有歌单",
+        "playlists.empty_hint" => "导入 .mp3list / .m3u，或把歌曲拖进队列后另存为歌单",
+        "playlists.save_current" => "队列另存为歌单",
+        "search.title" => "在线搜索",
+        "search.subtitle" => "可同时搜索本地与多个 Bamboo 音源",
+        "search.placeholder" => "搜索歌曲、歌手、专辑…",
+        "search.button" => "搜索",
+        "search.empty" => "输入关键字开始搜索",
+        "search.no_results" => "没有找到结果",
+        "search.load_more" => "加载更多",
+        "search.test_connection" => "测试连接",
+        "discover.title" => "发现",
+        "discover.subtitle" => "随机漫游、专辑与歌手推荐",
+        "discover.refresh" => "换一批",
+        "discover.open_link" => "打开分享链接",
+        "discover.link_hint" => "粘贴 Bamboo 分享链接或歌曲 ID",
+        "settings.title" => "设置",
+        "settings.appearance" => "外观",
+        "settings.playback" => "播放",
+        "settings.lyrics" => "歌词",
+        "settings.desktop_lyrics" => "桌面歌词",
+        "settings.online" => "在线音源",
+        "settings.playlist" => "歌单",
+        "settings.library" => "曲库",
+        "settings.download" => "下载与缓存",
+        "settings.window" => "窗口与托盘",
+        "settings.shortcuts" => "快捷键",
+        "settings.features" => "功能开关",
+        "settings.about" => "关于",
+        "settings.theme" => "主题",
+        "settings.accent" => "强调色",
+        "settings.background" => "背景模式",
+        "settings.font" => "字体",
+        "settings.font_size" => "字号",
+        "settings.roundness" => "圆角",
+        "settings.animations" => "动效",
+        "settings.language" => "界面语言",
+        "settings.volume" => "音量",
+        "settings.device" => "输出设备",
+        "settings.seek_step" => "快进/快退步长",
+        "settings.auto_advance" => "自动播放下一首",
+        "settings.resume" => "启动时恢复上次位置",
+        "settings.crossfade" => "交叉淡化秒数",
+        "settings.gapless" => "无缝播放",
+        "settings.replaygain" => "响度均衡",
+        "settings.eq" => "均衡器",
+        "settings.speed" => "播放速度",
+        "settings.encoding" => "歌词编码",
+        "settings.encoding_auto" => "自动识别",
+        "settings.offset" => "歌词偏移",
+        "settings.show_translation" => "显示翻译",
+        "settings.karaoke" => "逐字高亮",
+        "settings.sidebar" => "右侧常驻歌词栏",
+        "settings.lines" => "显示行数",
+        "settings.locked" => "锁定位置",
+        "settings.click_through" => "鼠标穿透",
+        "settings.always_on_top" => "总在最前",
+        "settings.show_footer" => "显示当前播放栏",
+        "settings.capture_protection" => "禁止被录屏/截图捕获",
+        "settings.capture_hint" => "需要 Windows 10 2004 或更高版本；捕获结果将看不到此窗口",
+        "settings.monitor" => "显示器",
+        "settings.bg_transparent" => "透明",
+        "settings.bg_solid" => "纯色",
+        "settings.bg_gradient" => "渐变",
+        "settings.bg_image" => "图片",
+        "settings.bg_blur" => "模糊封面",
+        "settings.close_behavior" => "关闭按钮行为",
+        "settings.close_tray" => "最小化到托盘",
+        "settings.close_exit" => "退出程序",
+        "settings.close_ask" => "每次询问",
+        "settings.start_minimized" => "启动时最小化",
+        "settings.base_url" => "API 地址",
+        "settings.add_source" => "添加音源",
+        "settings.quality" => "默认音质",
+        "settings.session_key" => "会话密钥",
+        "settings.headers" => "自定义请求头",
+        "settings.cookie" => "Cookie",
+        "settings.insecure_tls" => "信任自签名 HTTPS",
+        "settings.test" => "测试",
+        "settings.timeout" => "超时（秒）",
+        "settings.proxy" => "代理",
+        "settings.cache_limit" => "缓存上限（MB）",
+        "settings.clear_cache" => "清理缓存",
+        "settings.download_dir" => "下载目录",
+        "settings.template" => "命名模板",
+        "settings.concurrency" => "并发数",
+        "settings.embed_tags" => "写入标签",
+        "settings.save_lyrics" => "保存歌词",
+        "settings.features_hint" => "所有增强功能均可独立开关；关闭后界面入口与后台开销一并移除。",
+        "settings.reset" => "恢复默认设置",
+        "settings.open_data_dir" => "打开数据目录",
+        "settings.log_dir" => "打开日志目录",
+        "settings.version" => "版本",
+        "settings.portable" => "便携模式",
+        "common.on" => "开",
+        "common.off" => "关",
+        "common.auto" => "自动",
+        "common.reset" => "重置",
+        "common.apply" => "应用",
+        "common.cancel" => "取消",
+        "common.close" => "关闭",
+        "common.save" => "保存",
+        "common.browse" => "浏览…",
+        "common.none" => "无",
+        "common.seconds" => "秒",
+        "common.minutes" => "分钟",
+        "common.unknown" => "未知",
+        "common.enabled" => "已启用",
+        "common.disabled" => "已禁用",
+        "toast.imported" => "已导入",
+        "toast.exported" => "已导出",
+        "toast.files_added" => "已加入队列",
+        "toast.error" => "出错了",
+        "toast.copied" => "已复制",
+        "session.restored" => "已恢复上次的播放队列",
+        "audio.loading" => "正在加载…",
+        "audio.error" => "播放失败",
+        "audio.ended" => "播放结束",
+        "audio.unsupported" => "不支持的音频格式",
+        "tray.show" => "显示主窗口",
+        "tray.hide" => "隐藏主窗口",
+        "tray.play_pause" => "播放/暂停",
+        "tray.next" => "下一首",
+        "tray.prev" => "上一首",
+        "tray.desktop_lyrics" => "桌面歌词",
+        "tray.lock_lyrics" => "锁定桌面歌词",
+        "tray.shuffle" => "随机播放",
+        "tray.repeat" => "循环模式",
+        "tray.exit" => "退出",
+        "tray.volume" => "音量",
+        _ => key,
+    }
+}
+
+fn en(key: &'static str) -> &'static str {
+    match key {
+        "app.name" => "Bamboo Music Player",
+        "app.tagline" => "Fast · Native · Beautiful",
+        "nav.now_playing" => "Now Playing",
+        "nav.library" => "Library",
+        "nav.playlists" => "Playlists",
+        "nav.search" => "Online Search",
+        "nav.discover" => "Discover",
+        "nav.settings" => "Settings",
+        "nav.playlists_section" => "My Playlists",
+        "nav.queue" => "Queue",
+        "player.play" => "Play",
+        "player.pause" => "Pause",
+        "player.prev" => "Previous",
+        "player.next" => "Next",
+        "player.stop" => "Stop",
+        "player.shuffle" => "Shuffle",
+        "player.shuffle_on" => "Shuffle: on",
+        "player.repeat" => "Repeat",
+        "player.queue" => "Queue",
+        "player.lyrics" => "Lyrics",
+        "player.desktop_lyrics" => "Desktop lyrics",
+        "player.volume" => "Volume",
+        "player.mute" => "Mute",
+        "player.unmute" => "Unmute",
+        "player.no_track" => "Nothing is playing yet",
+        "player.no_track_hint" => "Drop audio files here, or start from your library or a playlist",
+        "player.open_files" => "Open files",
+        "player.open_folder" => "Open folder",
+        "player.clear_queue" => "Clear queue",
+        "player.remove" => "Remove from queue",
+        "player.play_now" => "Play now",
+        "player.add_to_queue" => "Add to queue",
+        "player.play_next" => "Play next",
+        "now.title" => "Now Playing",
+        "now.no_lyrics" => "No lyrics",
+        "now.no_lyrics_hint" => {
+            "Place a matching .lrc / .srt next to the song, or adjust the lyric encoding in Settings"
+        }
+        "now.source" => "Source",
+        "now.format" => "Format",
+        "now.quality" => "Quality",
+        "library.title" => "Library",
+        "library.subtitle" => "Scan local music and browse by song, album, artist or folder",
+        "library.add_folder" => "Add music folder",
+        "library.scan" => "Rescan",
+        "library.scanning" => "Scanning…",
+        "library.empty" => "Your library is empty",
+        "library.empty_hint" => "Add a music folder, or drop files into the window",
+        "library.songs" => "Songs",
+        "library.albums" => "Albums",
+        "library.artists" => "Artists",
+        "library.folders" => "Folders",
+        "library.play_all" => "Play all",
+        "playlists.title" => "Playlists",
+        "playlists.subtitle" => "Import / export .mp3list with folders and online tracks",
+        "playlists.import" => "Import playlist",
+        "playlists.export" => "Export playlist",
+        "playlists.new" => "New playlist",
+        "playlists.empty" => "No playlists yet",
+        "playlists.empty_hint" => "Import .mp3list / .m3u, or save the current queue as a playlist",
+        "playlists.save_current" => "Save queue as playlist",
+        "search.title" => "Online Search",
+        "search.subtitle" => "Search the local Bamboo library and multiple online sources",
+        "search.placeholder" => "Search songs, artists, albums…",
+        "search.button" => "Search",
+        "search.empty" => "Type a keyword to search",
+        "search.no_results" => "No results",
+        "search.load_more" => "Load more",
+        "search.test_connection" => "Test connection",
+        "discover.title" => "Discover",
+        "discover.subtitle" => "Random roam, albums and artists",
+        "discover.refresh" => "Refresh",
+        "discover.open_link" => "Open share link",
+        "discover.link_hint" => "Paste a Bamboo share link or song ID",
+        "settings.title" => "Settings",
+        "settings.appearance" => "Appearance",
+        "settings.playback" => "Playback",
+        "settings.lyrics" => "Lyrics",
+        "settings.desktop_lyrics" => "Desktop lyrics",
+        "settings.online" => "Online sources",
+        "settings.playlist" => "Playlists",
+        "settings.library" => "Library",
+        "settings.download" => "Downloads & cache",
+        "settings.window" => "Window & tray",
+        "settings.shortcuts" => "Shortcuts",
+        "settings.features" => "Feature switches",
+        "settings.about" => "About",
+        "settings.theme" => "Theme",
+        "settings.accent" => "Accent color",
+        "settings.background" => "Background",
+        "settings.font" => "Font",
+        "settings.font_size" => "Font size",
+        "settings.roundness" => "Corner radius",
+        "settings.animations" => "Animations",
+        "settings.language" => "Language",
+        "settings.volume" => "Volume",
+        "settings.device" => "Output device",
+        "settings.seek_step" => "Seek step",
+        "settings.auto_advance" => "Auto-play next",
+        "settings.resume" => "Resume last position",
+        "settings.crossfade" => "Crossfade (seconds)",
+        "settings.gapless" => "Gapless playback",
+        "settings.replaygain" => "ReplayGain",
+        "settings.eq" => "Equalizer",
+        "settings.speed" => "Playback speed",
+        "settings.encoding" => "Lyrics encoding",
+        "settings.encoding_auto" => "Auto-detect",
+        "settings.offset" => "Lyrics offset",
+        "settings.show_translation" => "Show translation",
+        "settings.karaoke" => "Karaoke highlight",
+        "settings.sidebar" => "Persistent lyrics sidebar",
+        "settings.lines" => "Lines",
+        "settings.locked" => "Lock position",
+        "settings.click_through" => "Click-through",
+        "settings.always_on_top" => "Always on top",
+        "settings.show_footer" => "Show now-playing footer",
+        "settings.capture_protection" => "Exclude from screen capture",
+        "settings.capture_hint" => {
+            "Requires Windows 10 2004+; capture tools will not see this window"
+        }
+        "settings.monitor" => "Monitor",
+        "settings.bg_transparent" => "Transparent",
+        "settings.bg_solid" => "Solid",
+        "settings.bg_gradient" => "Gradient",
+        "settings.bg_image" => "Image",
+        "settings.bg_blur" => "Blurred cover",
+        "settings.close_behavior" => "Close button",
+        "settings.close_tray" => "Minimize to tray",
+        "settings.close_exit" => "Exit",
+        "settings.close_ask" => "Ask every time",
+        "settings.start_minimized" => "Start minimized",
+        "settings.base_url" => "API URL",
+        "settings.add_source" => "Add source",
+        "settings.quality" => "Default quality",
+        "settings.session_key" => "Session key",
+        "settings.headers" => "Custom headers",
+        "settings.cookie" => "Cookie",
+        "settings.insecure_tls" => "Trust self-signed HTTPS",
+        "settings.test" => "Test",
+        "settings.timeout" => "Timeout (s)",
+        "settings.proxy" => "Proxy",
+        "settings.cache_limit" => "Cache limit (MB)",
+        "settings.clear_cache" => "Clear cache",
+        "settings.download_dir" => "Download folder",
+        "settings.template" => "Filename template",
+        "settings.concurrency" => "Concurrency",
+        "settings.embed_tags" => "Write tags",
+        "settings.save_lyrics" => "Save lyrics",
+        "settings.features_hint" => {
+            "Every enhancement can be switched off; its UI and background work are removed with it."
+        }
+        "settings.reset" => "Reset settings",
+        "settings.open_data_dir" => "Open data folder",
+        "settings.log_dir" => "Open log folder",
+        "settings.version" => "Version",
+        "settings.portable" => "Portable mode",
+        "common.on" => "On",
+        "common.off" => "Off",
+        "common.auto" => "Auto",
+        "common.reset" => "Reset",
+        "common.apply" => "Apply",
+        "common.cancel" => "Cancel",
+        "common.close" => "Close",
+        "common.save" => "Save",
+        "common.browse" => "Browse…",
+        "common.none" => "None",
+        "common.seconds" => "s",
+        "common.minutes" => "min",
+        "common.unknown" => "Unknown",
+        "common.enabled" => "On",
+        "common.disabled" => "Off",
+        "toast.imported" => "Imported",
+        "toast.exported" => "Exported",
+        "toast.files_added" => "Added to queue",
+        "toast.error" => "Something went wrong",
+        "toast.copied" => "Copied",
+        "session.restored" => "Restored your previous queue",
+        "audio.loading" => "Loading…",
+        "audio.error" => "Playback failed",
+        "audio.ended" => "Playback finished",
+        "audio.unsupported" => "Unsupported audio format",
+        "tray.show" => "Show window",
+        "tray.hide" => "Hide window",
+        "tray.play_pause" => "Play / Pause",
+        "tray.next" => "Next",
+        "tray.prev" => "Previous",
+        "tray.desktop_lyrics" => "Desktop lyrics",
+        "tray.lock_lyrics" => "Lock desktop lyrics",
+        "tray.shuffle" => "Shuffle",
+        "tray.repeat" => "Repeat",
+        "tray.exit" => "Exit",
+        "tray.volume" => "Volume",
+        _ => key,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_source_text_and_falls_back() {
+        assert_eq!(tr_in(Language::ZhCn, "播放"), "播放");
+        assert_eq!(tr_in(Language::EnUs, "播放"), "Play");
+        assert_eq!(tr_in(Language::EnUs, "设置"), "Settings");
+        assert_eq!(
+            tr_in(Language::EnUs, "没有翻译的字符串"),
+            "没有翻译的字符串"
+        );
+        assert_eq!(
+            format_template_in(Language::EnUs, "{} 首", &[&3 as &dyn std::fmt::Display]),
+            "3 tracks"
+        );
+        assert_eq!(
+            format_template_in(
+                Language::EnUs,
+                "第 {index} / {count} 行",
+                &[&2 as &dyn std::fmt::Display, &5]
+            ),
+            "Line 2 / 5"
+        );
+        assert_eq!(tr_in(Language::ZhCn, "设置"), "设置");
+        assert_eq!(
+            format_template_in(Language::ZhCn, "{} 首", &[&3 as &dyn std::fmt::Display]),
+            "3 首"
+        );
+    }
+
+    #[test]
+    fn every_wrapped_ui_literal_has_an_english_entry() {
+        // scripts/i18n_strings.json is generated by scripts/wrap_i18n.py.
+        let strings: Vec<String> =
+            serde_json::from_str(include_str!("../../../scripts/i18n_strings.json")).unwrap();
+        let missing: Vec<&String> = strings
+            .iter()
+            .filter(|text| !ENGLISH.contains_key(text.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "missing translations: {missing:?}");
+    }
+}

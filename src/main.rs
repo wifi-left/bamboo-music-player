@@ -147,8 +147,10 @@ use crate::overlay_host::{DesktopHost, MiniHost};
 use crate::overlay_protocol::{MiniAction, OverlayAction};
 use crate::gamepad::{Gamepad, GamepadAction};
 use crate::player_panel::{
-    ACTION_OPEN_SETTINGS, ACTION_SET_VOLUME, ACTION_SPEED_DOWN, ACTION_SPEED_UP,
-    ACTION_TOGGLE_EQ, ACTION_TOGGLE_PITCH, PlayerPanel, WM_APP_PLAYER_ACTION,
+    ACTION_AB_CLEAR, ACTION_AB_END, ACTION_AB_START, ACTION_DEVICE_DELTA, ACTION_OPEN_SETTINGS,
+    ACTION_SET_SLEEP, ACTION_SET_VOLUME, ACTION_SLEEP_CUSTOM_DELTA, ACTION_SPEED_DOWN,
+    ACTION_SPEED_UP, ACTION_TOGGLE_DESKTOP_LYRICS, ACTION_TOGGLE_EQ, ACTION_TOGGLE_MINI_PLAYER,
+    ACTION_TOGGLE_PITCH, PlayerPanel, WM_APP_PLAYER_ACTION,
 };
 use crate::paint::Painter;
 
@@ -6070,11 +6072,64 @@ unsafe extern "system" fn window_proc(
                         let volume = (lparam.0 as f32 / 1000.0).clamp(0.0, 1.0);
                         state.app.set_volume(volume);
                     }
-                    crate::player_panel::ACTION_TOGGLE_DESKTOP_LYRICS => state
+                    ACTION_SET_SLEEP => {
+                        let minutes = match lparam.0 {
+                            15 => Some(15),
+                            30 => Some(30),
+                            60 => Some(60),
+                            _ => None,
+                        };
+                        state
+                            .app
+                            .core
+                            .handle(crate::core::app::Command::SetSleepTimer(minutes));
+                    }
+                    ACTION_SLEEP_CUSTOM_DELTA => {
+                        let current =
+                            state.app.core.sleep_selected_minutes().unwrap_or(0) as i32;
+                        let next = (current + lparam.0 as i32).clamp(0, 720);
+                        state.app.core.handle(crate::core::app::Command::SetSleepTimer(
+                            (next > 0).then_some(next as u32),
+                        ));
+                    }
+                    ACTION_AB_START => state
+                        .app
+                        .core
+                        .handle(crate::core::app::Command::SetABStart),
+                    ACTION_AB_END => state
+                        .app
+                        .core
+                        .handle(crate::core::app::Command::SetABEnd),
+                    ACTION_AB_CLEAR => state
+                        .app
+                        .core
+                        .handle(crate::core::app::Command::ClearABRepeat),
+                    ACTION_DEVICE_DELTA => {
+                        let current = state.app.core.settings.playback.device.clone();
+                        let mut options: Vec<Option<String>> = vec![None];
+                        options.extend(
+                            state.app.core.output_devices().into_iter().map(Some),
+                        );
+                        let index = current
+                            .as_ref()
+                            .and_then(|device| {
+                                options.iter().position(|item| item.as_ref() == Some(device))
+                            })
+                            .unwrap_or(0) as i32;
+                        let next =
+                            (index + lparam.0 as i32).rem_euclid(options.len() as i32) as usize;
+                        state
+                            .app
+                            .core
+                            .handle(crate::core::app::Command::SetOutputDevice(
+                                options[next].clone(),
+                            ));
+                    }
+                    ACTION_TOGGLE_DESKTOP_LYRICS => state
                         .app
                         .core
                         .handle(crate::core::app::Command::ToggleDesktopLyrics),
-                    crate::player_panel::ACTION_TOGGLE_MINI_PLAYER => state
+                    ACTION_TOGGLE_MINI_PLAYER => state
                         .app
                         .core
                         .handle(crate::core::app::Command::ToggleMiniPlayer),

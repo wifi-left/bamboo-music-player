@@ -4,6 +4,8 @@
 //! Widget rectangles are stable for the lifetime of a window size, so a state
 //! change can invalidate exactly one rectangle instead of the whole window.
 
+use crate::player_panel::{PANEL_BASE_HEIGHT, PANEL_EXTRAS_HEIGHT, PANEL_WIDTH};
+
 pub const SIDEBAR_WIDTH: f32 = 216.0;
 pub const PLAYER_HEIGHT: f32 = 92.0;
 pub const HEADER_HEIGHT: f32 = 64.0;
@@ -87,6 +89,9 @@ pub struct Layout {
     /// Library search box (native EDIT child) and its header buttons.
     pub search: Rect,
     pub sort: Rect,
+    /// Smart-playlist kind / duplicate-mode chip, parked in the header's
+    /// top-right corner so it never covers the first list row.
+    pub header_sort: Rect,
     pub add_folder: Rect,
     pub rescan: Rect,
     pub list: Rect,
@@ -400,6 +405,23 @@ pub fn step_rects(area: Rect) -> (Rect, Rect, Rect) {
     let plus = Rect::new(area.right - button, area.top, area.right, area.bottom);
     let value = Rect::new(minus.right + 4.0, area.top, plus.left - 4.0, area.bottom);
     (minus, value, plus)
+}
+
+/// Trailing "restore default" chip on action rows (custom font family rows).
+pub fn action_reset_rect(control: Rect) -> Rect {
+    let width = 76.0;
+    Rect::new(
+        control.right - width,
+        control.top + 3.0,
+        control.right,
+        control.bottom - 3.0,
+    )
+}
+
+/// Main button part of an action row that also carries a reset chip.
+pub fn action_main_rect(control: Rect) -> Rect {
+    let reset = action_reset_rect(control);
+    Rect::new(control.left, control.top, reset.left - 4.0, control.bottom)
 }
 
 /// The three dedupe modes shown as a segmented control.
@@ -742,6 +764,14 @@ pub fn compute_with(width: f32, height: f32, big_lyrics: bool, visualizer_visibl
         list.right,
         HEADER_HEIGHT + 34.0,
     );
+    // The smart/duplicate selector is the only header control on those pages;
+    // keep it inside the title strip instead of floating over row 0.
+    let header_sort = Rect::new(
+        header.right - 150.0,
+        header.top + 16.0,
+        header.right,
+        header.top + 44.0,
+    );
     let search = Rect::new(
         list.left,
         HEADER_HEIGHT + 6.0,
@@ -912,15 +942,27 @@ pub fn compute_with(width: f32, height: f32, big_lyrics: bool, visualizer_visibl
 
     // Flyout sits above the gear; the child window is raised above siblings.
     // Narrow windows hide the desktop-lyrics/mini-player buttons from the
-    // player bar, so the panel grows to show them (disabled until wired) and
-    // carries a volume slider because the bar hides its slider below 820 DIP.
-    let panel_width = 260.0;
-    let panel_height = if show_extra { 208.0 } else { 264.0 };
+    // player bar, so the panel grows to show them and carries a volume slider
+    // because the bar hides its slider below 820 DIP. If even the taller panel
+    // would not fit above the bar, drop the extra rows rather than covering
+    // the transport controls.
+    let max_panel_height = (player.top - (header.bottom + 8.0) - 6.0).max(1.0);
+    let desired_height = if show_extra {
+        PANEL_BASE_HEIGHT
+    } else {
+        PANEL_EXTRAS_HEIGHT
+    };
+    let panel_height = if desired_height <= max_panel_height {
+        desired_height
+    } else {
+        PANEL_BASE_HEIGHT
+    };
+    let panel_left = (player_settings.right - PANEL_WIDTH).max(8.0);
     let panel_top = (player.top - panel_height - 6.0).max(header.bottom + 8.0);
     let player_panel = Rect::new(
-        (player_settings.right - panel_width).max(8.0),
+        panel_left,
         panel_top,
-        (player_settings.right - panel_width).max(8.0) + panel_width,
+        panel_left + PANEL_WIDTH,
         panel_top + panel_height,
     );
 
@@ -1039,6 +1081,7 @@ pub fn compute_with(width: f32, height: f32, big_lyrics: bool, visualizer_visibl
         header,
         search,
         sort,
+        header_sort,
         add_folder,
         rescan,
         list,
@@ -1144,6 +1187,33 @@ mod tests {
         // It must also overlap the generic list rect, because row-cover
         // invalidations use `layout.list` and start at the filter's top edge.
         assert!(toolbar.intersects(layout.list));
+    }
+
+    #[test]
+    fn smart_and_duplicate_chip_stays_in_the_header() {
+        let layout = compute_with(1200.0, 800.0, false, false);
+        // The chip must not cover the first list row: that overlap let a row
+        // repaint draw its duration over the button and left residue.
+        assert!(layout.header_sort.top >= layout.header.top);
+        assert!(layout.header_sort.bottom <= layout.header.bottom);
+        assert!(layout.header_sort.bottom <= layout.list.top);
+        assert!(layout.header_sort.right <= layout.header.right);
+    }
+
+    #[test]
+    fn playback_flyout_fits_above_the_player_bar() {
+        let wide = compute_with(1200.0, 800.0, false, false);
+        assert!((wide.player_panel.height() - crate::player_panel::PANEL_BASE_HEIGHT).abs() < 0.5);
+        assert!(wide.player_panel.bottom <= wide.player.top);
+        let narrow = compute_with(700.0, 800.0, false, false);
+        assert!(
+            (narrow.player_panel.height() - crate::player_panel::PANEL_EXTRAS_HEIGHT).abs() < 0.5
+        );
+        assert!(narrow.player_panel.bottom <= narrow.player.top);
+        // At the minimum height the extra rows are dropped instead of covering
+        // the transport controls.
+        let short = compute_with(700.0, 460.0, false, false);
+        assert!((short.player_panel.height() - crate::player_panel::PANEL_BASE_HEIGHT).abs() < 0.5);
     }
 
     #[test]

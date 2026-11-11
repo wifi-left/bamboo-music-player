@@ -342,6 +342,9 @@ pub enum SettingField {
     DesktopTranslation,
     DesktopFooter,
     DesktopFontSize,
+    DesktopNextFontSize,
+    DesktopPrevFontSize,
+    DesktopFooterFontSize,
     DesktopFrameRate,
     DesktopBold,
     DesktopAlign,
@@ -628,7 +631,7 @@ const LARGE_FIELDS: [SettingField; 24] = [
     SettingField::LargeTranslationColor,
 ];
 
-const DESKTOP_FIELDS: [SettingField; 61] = [
+const DESKTOP_FIELDS: [SettingField; 64] = [
     SettingField::DesktopShow,
     SettingField::DesktopLock,
     SettingField::DesktopClickThrough,
@@ -637,6 +640,9 @@ const DESKTOP_FIELDS: [SettingField; 61] = [
     SettingField::DesktopTranslation,
     SettingField::DesktopFooter,
     SettingField::DesktopFontSize,
+    SettingField::DesktopNextFontSize,
+    SettingField::DesktopPrevFontSize,
+    SettingField::DesktopFooterFontSize,
     SettingField::DesktopFrameRate,
     SettingField::DesktopBold,
     SettingField::DesktopAlign,
@@ -1552,6 +1558,16 @@ impl App {
         }
     }
 
+    /// Sort / smart-kind / duplicate-mode chip. Smart and duplicate pages keep
+    /// it in the header so it cannot cover the first row (and its repaint can
+    /// no longer paint the row's duration over the button).
+    pub fn page_sort_rect(&self) -> Rect {
+        match self.page {
+            Page::Smart | Page::Duplicates => self.layout.header_sort,
+            _ => self.layout.sort,
+        }
+    }
+
     /// Rows that fit above the pager without scrolling.
     pub fn library_page_size(&self) -> usize {
         (self.layout.library_list.height() / self.row_height())
@@ -1722,6 +1738,7 @@ impl App {
             | Target::SettingsChoiceCycle(index)
             | Target::SettingsStep(index, _)
             | Target::SettingsAction(index)
+            | Target::SettingsActionReset(index)
             | Target::SettingsText(index)
             | Target::SettingsColor(index) => Some(index),
             _ => None,
@@ -2976,6 +2993,30 @@ impl App {
                 options: &[],
                 selected: None,
             },
+            SettingField::DesktopNextFontSize => SettingView {
+                label: "下一行字号",
+                kind: SettingKind::Step,
+                value: format!("{:.0}", desktop.next_font_size),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DesktopPrevFontSize => SettingView {
+                label: "上一行字号",
+                kind: SettingKind::Step,
+                value: format!("{:.0}", desktop.prev_font_size),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DesktopFooterFontSize => SettingView {
+                label: "信息字号",
+                kind: SettingKind::Step,
+                value: format!("{:.0}", desktop.footer_font_size),
+                active: false,
+                options: &[],
+                selected: None,
+            },
             SettingField::DesktopFrameRate => SettingView {
                 label: "帧率",
                 kind: SettingKind::Step,
@@ -3413,6 +3454,23 @@ impl App {
                 options: &[],
                 selected: None,
             },
+        }
+    }
+
+    /// Font-family rows that can be reset to "follow the UI (or main line)".
+    pub fn font_reset_command(field: SettingField) -> Option<Command> {
+        match field {
+            SettingField::LyricsFontFamily => Some(Command::SetLyricsFontFamily(None)),
+            SettingField::LargeFontFamily => Some(Command::SetLargeLyricsFontFamily(None)),
+            SettingField::DesktopFontFamily => Some(Command::SetDesktopLyricsFontFamily(None)),
+            SettingField::DesktopTransFontFamily => {
+                Some(Command::SetDesktopLyricsTranslationFontFamily(None))
+            }
+            SettingField::DesktopFooterFontFamily => {
+                Some(Command::SetDesktopLyricsFooterFontFamily(None))
+            }
+            SettingField::ThemeFontFamily => Some(Command::SetThemeFontFamily(None)),
+            _ => None,
         }
     }
 
@@ -3863,6 +3921,15 @@ impl App {
             ),
             SettingField::DesktopFontSize => Command::DesktopLyricsSetFontSize(
                 self.core.settings.desktop_lyrics.font_size + delta as f32,
+            ),
+            SettingField::DesktopNextFontSize => Command::DesktopLyricsSetNextFontSize(
+                self.core.settings.desktop_lyrics.next_font_size + delta as f32,
+            ),
+            SettingField::DesktopPrevFontSize => Command::DesktopLyricsSetPrevFontSize(
+                self.core.settings.desktop_lyrics.prev_font_size + delta as f32,
+            ),
+            SettingField::DesktopFooterFontSize => Command::DesktopLyricsSetFooterFontSize(
+                self.core.settings.desktop_lyrics.footer_font_size + delta as f32,
             ),
             SettingField::DesktopFrameRate => Command::DesktopLyricsSetFrameRate(
                 (self.core.settings.desktop_lyrics.frame_rate as i32 + delta * 5)
@@ -5490,6 +5557,38 @@ impl App {
                     }
                 }
             }
+            Page::Library | Page::Smart | Page::Duplicates => {
+                // These lists highlight the current row by file path, not by
+                // queue index, so map the old/new queue entries back to the
+                // visible rows. Without this the previous highlight stayed on
+                // screen until the next hover repainted it.
+                let rows: Vec<usize> = {
+                    let snapshot = self.core.snapshot();
+                    let path_of = |index: Option<usize>| {
+                        index
+                            .and_then(|index| snapshot.queue.get(index))
+                            .and_then(|track| track.source.path())
+                    };
+                    let old_path = path_of(old_index);
+                    let new_path = path_of(new_index);
+                    let entries: &[_] = match self.page {
+                        Page::Smart => snapshot.library_smart,
+                        Page::Duplicates => snapshot.library_duplicate_rows,
+                        _ => snapshot.library,
+                    };
+                    let (first, last) = self.visible_rows();
+                    (first..last.min(entries.len()))
+                        .filter(|row| {
+                            let path = entries[*row].path.as_path();
+                            old_path.is_some_and(|old| old == path)
+                                || new_path.is_some_and(|new| new == path)
+                        })
+                        .collect()
+                };
+                for row in rows {
+                    self.invalidate(hwnd, self.row_rect(row));
+                }
+            }
             _ => {}
         }
     }
@@ -5579,10 +5678,10 @@ impl App {
         {
             return Some(Target::DesktopLyrics);
         }
-        if self.page == Page::Smart && self.layout.sort.inflate(2.0).contains(x, y) {
+        if self.page == Page::Smart && self.page_sort_rect().inflate(2.0).contains(x, y) {
             return Some(Target::SmartKind);
         }
-        if self.page == Page::Duplicates && self.layout.sort.inflate(2.0).contains(x, y) {
+        if self.page == Page::Duplicates && self.page_sort_rect().inflate(2.0).contains(x, y) {
             return Some(Target::DuplicateMode);
         }
         if self.page == Page::Search {
@@ -5789,6 +5888,22 @@ impl App {
                             }
                         }
                         SettingKind::Action => {
+                            let reset_available = view.active
+                                && self
+                                    .settings_tab
+                                    .fields()
+                                    .get(index)
+                                    .copied()
+                                    .is_some_and(|field| {
+                                        Self::font_reset_command(field).is_some()
+                                    });
+                            if reset_available
+                                && layout::action_reset_rect(control)
+                                    .inflate(2.0)
+                                    .contains(x, y)
+                            {
+                                return Some(Target::SettingsActionReset(index));
+                            }
                             if control.inflate(2.0).contains(x, y) {
                                 return Some(Target::SettingsAction(index));
                             }
@@ -6015,6 +6130,13 @@ impl App {
                 control.bottom -= self.settings_scroll;
                 control.inflate(2.0)
             }
+            Target::SettingsActionReset(index) => {
+                let settings = layout::settings(&self.layout);
+                let mut control = layout::setting_control(&settings, index);
+                control.top -= self.settings_scroll;
+                control.bottom -= self.settings_scroll;
+                layout::action_reset_rect(control).inflate(2.0)
+            }
             Target::SettingsScrollbar => layout::settings(&self.layout).scrollbar.inflate(2.0),
             Target::FolderRemove(row) => {
                 let settings = layout::settings(&self.layout);
@@ -6028,7 +6150,7 @@ impl App {
             Target::LyricsBig => self.layout.lyric_buttons[2].inflate(2.0),
             Target::LyricsEdit => self.layout.lyric_buttons[3].inflate(2.0),
             Target::LyricsReload => self.layout.lyric_buttons[4].inflate(2.0),
-            Target::SmartKind | Target::DuplicateMode => self.layout.sort.inflate(2.0),
+            Target::SmartKind | Target::DuplicateMode => self.layout.header_sort.inflate(2.0),
             Target::OnlineKind | Target::OnlineBack => self.layout.online_kind.inflate(2.0),
             Target::OnlineQueueAll => self.layout.online_queue_all.inflate(2.0),
             Target::OnlineRandom => self.layout.online_random.inflate(2.0),
@@ -6330,7 +6452,7 @@ impl App {
             }
         }
 
-        if self.page == Page::Smart && self.layout.sort.inflate(2.0).contains(x, y) {
+        if self.page == Page::Smart && self.page_sort_rect().inflate(2.0).contains(x, y) {
             let current = self.core.snapshot().library_smart_kind;
             let index = crate::core::library::SmartKind::ALL
                 .iter()
@@ -6343,7 +6465,7 @@ impl App {
             self.invalidate_all(hwnd);
             return;
         }
-        if self.page == Page::Duplicates && self.layout.sort.inflate(2.0).contains(x, y) {
+        if self.page == Page::Duplicates && self.page_sort_rect().inflate(2.0).contains(x, y) {
             let current = self.core.snapshot().library_duplicate_mode;
             let index = DEDUPE_ORDER
                 .iter()
@@ -6493,7 +6615,24 @@ impl App {
                                 return;
                             }
                         }
-                        SettingKind::Action | SettingKind::Text => {
+                        SettingKind::Action => {
+                            if view.active
+                                && let Some(command) = Self::font_reset_command(field)
+                                && layout::action_reset_rect(control)
+                                    .inflate(2.0)
+                                    .contains(x, y)
+                            {
+                                self.core.handle(command);
+                                self.core.flush_settings();
+                                self.invalidate_all(hwnd);
+                                return;
+                            }
+                            if control.inflate(2.0).contains(x, y) {
+                                self.apply_setting(hwnd, index, None, 0);
+                                return;
+                            }
+                        }
+                        SettingKind::Text => {
                             if control.inflate(2.0).contains(x, y) {
                                 self.apply_setting(hwnd, index, None, 0);
                                 return;
@@ -7145,6 +7284,9 @@ impl App {
             SettingField::LargeLyricsFontSize => settings.large_lyrics.font_size,
             SettingField::LargeLineSpacing => settings.large_lyrics.line_spacing,
             SettingField::DesktopFontSize => settings.desktop_lyrics.font_size,
+            SettingField::DesktopNextFontSize => settings.desktop_lyrics.next_font_size,
+            SettingField::DesktopPrevFontSize => settings.desktop_lyrics.prev_font_size,
+            SettingField::DesktopFooterFontSize => settings.desktop_lyrics.footer_font_size,
             SettingField::DesktopFrameRate => settings.desktop_lyrics.frame_rate as f32,
             SettingField::DesktopOpacity => settings.desktop_lyrics.opacity * 100.0,
             SettingField::DesktopRadius => settings.desktop_lyrics.radius as f32,
@@ -7350,6 +7492,9 @@ impl App {
                 | SettingField::LargeLyricsFontSize
                 | SettingField::LargeLineSpacing
                 | SettingField::DesktopFontSize
+                | SettingField::DesktopNextFontSize
+                | SettingField::DesktopPrevFontSize
+                | SettingField::DesktopFooterFontSize
                 | SettingField::DesktopFrameRate
                 | SettingField::DesktopOpacity
                 | SettingField::DesktopRadius
@@ -7439,6 +7584,11 @@ impl App {
             SettingField::LargeLyricsFontSize => Command::SetLargeLyricsFontSize(value),
             SettingField::LargeLineSpacing => Command::SetLargeLyricsLineSpacing(value),
             SettingField::DesktopFontSize => Command::DesktopLyricsSetFontSize(value),
+            SettingField::DesktopNextFontSize => Command::DesktopLyricsSetNextFontSize(value),
+            SettingField::DesktopPrevFontSize => Command::DesktopLyricsSetPrevFontSize(value),
+            SettingField::DesktopFooterFontSize => {
+                Command::DesktopLyricsSetFooterFontSize(value)
+            }
             SettingField::DesktopFrameRate => {
                 Command::DesktopLyricsSetFrameRate(value.round().clamp(15.0, 120.0) as u32)
             }
@@ -7778,8 +7928,8 @@ impl App {
                 out.extend((0..recent.min(visible)).map(Target::StatsRecent));
             }
             Page::Downloads => out.extend([Target::DownloadsCleanPart, Target::DownloadsClearFinished]),
-            Page::Smart => out.extend([Target::Sort, Target::SmartKind]),
-            Page::Duplicates => out.extend([Target::Sort, Target::DuplicateMode]),
+            Page::Smart => out.extend([Target::SmartKind]),
+            Page::Duplicates => out.extend([Target::DuplicateMode]),
             // Focused settings rows would require inline editors; tabs are the
             // useful keyboard navigation target on this page.
             Page::Settings => {
@@ -8780,8 +8930,11 @@ fn intersect_rect(a: Rect, b: Rect) -> Rect {
 /// Open Explorer at the downloaded file. Failures are non-fatal (the file may
 /// live on a disconnected drive).
 fn reveal_path(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
     let mut command = std::process::Command::new("explorer");
-    command.arg(format!("/select,{}", path.display()));
+    // `explorer` reparses its own command line: without quotes a path with
+    // spaces is truncated and Explorer falls back to the Documents folder.
+    command.raw_arg(format!("/select,\"{}\"", path.display()));
     if let Err(err) = command.spawn() {
         tracing::warn!("open download location failed: {err}");
     }

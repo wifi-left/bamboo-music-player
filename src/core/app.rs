@@ -237,6 +237,10 @@ pub enum Command {
     DesktopLyricsSetWordsOnly(bool),
     /// Absolute current-line size; next/prev follow the same ratios.
     DesktopLyricsSetFontSize(f32),
+    /// Independent overrides for the secondary rows (previous / next / footer).
+    DesktopLyricsSetNextFontSize(f32),
+    DesktopLyricsSetPrevFontSize(f32),
+    DesktopLyricsSetFooterFontSize(f32),
     /// Karaoke animation refresh rate for the desktop lyrics window.
     DesktopLyricsSetFrameRate(u32),
     /// Native move/resize reported by the overlay (logical points).
@@ -2359,6 +2363,18 @@ impl AppCore {
                 settings.font_size = size;
                 settings.next_font_size = (size * 0.76).clamp(6.0, 160.0);
                 settings.prev_font_size = (size * 0.70).clamp(6.0, 160.0);
+                self.settings_dirty = true;
+            }
+            Command::DesktopLyricsSetNextFontSize(size) => {
+                self.settings.desktop_lyrics.next_font_size = size.clamp(6.0, 120.0);
+                self.settings_dirty = true;
+            }
+            Command::DesktopLyricsSetPrevFontSize(size) => {
+                self.settings.desktop_lyrics.prev_font_size = size.clamp(6.0, 120.0);
+                self.settings_dirty = true;
+            }
+            Command::DesktopLyricsSetFooterFontSize(size) => {
+                self.settings.desktop_lyrics.footer_font_size = size.clamp(6.0, 48.0);
                 self.settings_dirty = true;
             }
             Command::DesktopLyricsSetFrameRate(fps) => {

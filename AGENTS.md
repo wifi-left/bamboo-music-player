@@ -89,6 +89,10 @@ Bamboo Music Player — Windows 原生音乐播放器，主窗口使用 Win32 + 
 - 大封面优先 WIC（clipper/scaler）解码，失败再回退 `image` crate；禁止在
   UI 线程解码或在切歌路径上重复解码同一张大图。
 
+## Git
+
+- 后续修改直接提交并 push 到 `main`（用户已授权，不必另开分支或 PR）。
+
 ## 常用命令
 
 ```powershell

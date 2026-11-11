@@ -969,6 +969,7 @@ impl Painter {
             Page::Search => layout.header.right,
             Page::Queue => layout.queue_import.left - 12.0,
             Page::Discover => layout.discover_refresh.left - 12.0,
+            Page::Smart | Page::Duplicates => layout.header_sort.left - 12.0,
             _ => layout.header.right,
         };
         let subtitle_rect = Rect::new(
@@ -989,18 +990,19 @@ impl Painter {
         );
 
         let controls = layout::library_controls(&layout);
-        if app.page == Page::Smart && hits(layout.sort.inflate(2.0), dirty) {
+        let page_sort = app.page_sort_rect();
+        if app.page == Page::Smart && hits(page_sort.inflate(2.0), dirty) {
             let snapshot = app.core.snapshot();
             self.button(
                 hdc,
-                layout.sort,
+                page_sort,
                 &format!("智能 · {} ▾", snapshot.library_smart_kind.label()),
                 scale,
                 dpi,
                 app.button_state(Target::SmartKind, false),
             );
         }
-        if app.page == Page::Duplicates && hits(layout.sort.inflate(2.0), dirty) {
+        if app.page == Page::Duplicates && hits(page_sort.inflate(2.0), dirty) {
             let snapshot = app.core.snapshot();
             let mode = match snapshot.library_duplicate_mode {
                 crate::config::DedupeMode::Metadata => "元数据",
@@ -1009,7 +1011,7 @@ impl Painter {
             };
             self.button(
                 hdc,
-                layout.sort,
+                page_sort,
                 &format!("查重 · {mode} ▾"),
                 scale,
                 dpi,
@@ -2629,14 +2631,42 @@ impl Painter {
                     }
                 }
                 crate::app::SettingKind::Action => {
-                    self.button(
-                        hdc,
-                        control,
-                        &view.value,
-                        scale,
-                        dpi,
-                        app.button_state(Target::SettingsAction(index), view.active),
-                    );
+                    let reset_available = view.active
+                        && app
+                            .settings_tab
+                            .fields()
+                            .get(index)
+                            .copied()
+                            .is_some_and(|field| {
+                                crate::app::App::font_reset_command(field).is_some()
+                            });
+                    if reset_available {
+                        self.button(
+                            hdc,
+                            layout::action_main_rect(control),
+                            &view.value,
+                            scale,
+                            dpi,
+                            app.button_state(Target::SettingsAction(index), view.active),
+                        );
+                        self.button(
+                            hdc,
+                            layout::action_reset_rect(control),
+                            "恢复默认",
+                            scale,
+                            dpi,
+                            app.button_state(Target::SettingsActionReset(index), false),
+                        );
+                    } else {
+                        self.button(
+                            hdc,
+                            control,
+                            &view.value,
+                            scale,
+                            dpi,
+                            app.button_state(Target::SettingsAction(index), view.active),
+                        );
+                    }
                 }
                 crate::app::SettingKind::Text => {
                     let editing = app.is_text_edit_row(index);

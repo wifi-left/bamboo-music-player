@@ -1,4 +1,5 @@
-//! Playback settings flyout (speed / equalizer / pitch).
+//! Playback settings flyout (volume / speed / equalizer / pitch / sleep timer /
+//! A-B loop / output device).
 //!
 //! A small native child window anchored above the player bar's gear button.
 //! It is a sibling of the lyric child and is raised with `HWND_TOP` while
@@ -12,9 +13,10 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, REC
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_CENTER,
-    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-    EndPaint, FillRect, HBRUSH, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DeleteObject, DrawTextW, EndPaint, FillRect, HBRUSH, HBITMAP, HDC, HFONT, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -22,15 +24,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetClientRect, HWND_TOP, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WINDOW_EX_STYLE, WS_CHILD,
-    WS_CLIPSIBLINGS,
-    GetWindowLongPtrW, PostMessageW, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HWND_TOP,
+    PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCDESTROY, WM_PAINT, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPSIBLINGS,
 };
 use windows::core::{PCWSTR, Result, w};
 
 use crate::app::App;
+use crate::core::util::format_time;
 use crate::layout::Rect;
 use crate::theme::Palette;
 use crate::ui::ButtonState;
@@ -49,17 +51,150 @@ pub const ACTION_SET_VOLUME: usize = 6;
 /// Narrow-window overlay rows.
 pub const ACTION_TOGGLE_DESKTOP_LYRICS: usize = 7;
 pub const ACTION_TOGGLE_MINI_PLAYER: usize = 8;
+/// `lparam` carries the preset length in minutes (0 = off).
+pub const ACTION_SET_SLEEP: usize = 9;
+/// `lparam` carries the custom-step delta in minutes (-5 / +5).
+pub const ACTION_SLEEP_CUSTOM_DELTA: usize = 10;
+pub const ACTION_AB_START: usize = 11;
+pub const ACTION_AB_END: usize = 12;
+pub const ACTION_AB_CLEAR: usize = 13;
+/// `lparam` carries the device-list delta (-1 / +1).
+pub const ACTION_DEVICE_DELTA: usize = 14;
+
+/// Panel size in DIP. `layout::compute_with` uses these so the child window
+/// and the painted rows cannot drift apart.
+pub const PANEL_WIDTH: f32 = 300.0;
+pub const PANEL_BASE_HEIGHT: f32 = 272.0;
+/// Extra height for the desktop-lyrics/mini-player rows hidden by the player
+/// bar on narrow windows.
+pub const PANEL_EXTRAS_HEIGHT: f32 = 330.0;
 
 const CLASS_NAME: PCWSTR = w!("BambooPlayerPanel");
-const CONTROL_COUNT: usize = 5;
-/// Hover index for the volume slider (kept separate from `controls`).
-const VOLUME_CONTROL: usize = 5;
 
-// Panel-local DIP layout. Must match `layout::compute_with`'s
-// `player_panel` size (260 wide; 208 tall normally, 264 when narrow).
-const VOLUME_TRACK: Rect = Rect::new(90.0, 52.0, 210.0, 56.0);
-const VOLUME_HIT: Rect = Rect::new(84.0, 42.0, 216.0, 66.0);
+// Panel-local DIP layout.
+const LEFT: f32 = 14.0;
+const RIGHT: f32 = PANEL_WIDTH - 14.0;
+const LABEL_RIGHT: f32 = 100.0;
+/// Left edge of the control column (steppers, segmented rows).
+const CONTROL_X: f32 = 104.0;
+const ROW_H: f32 = 26.0;
+const CONTROL_H: f32 = 22.0;
 
+const ROW_VOLUME: f32 = 32.0;
+const ROW_SPEED: f32 = 58.0;
+const ROW_EQ: f32 = 84.0;
+const ROW_PITCH: f32 = 110.0;
+const ROW_SLEEP: f32 = 136.0;
+const ROW_CUSTOM: f32 = 162.0;
+const ROW_AB: f32 = 188.0;
+const ROW_DEVICE: f32 = 214.0;
+const ROW_LINK: f32 = 244.0;
+const LINK_H: f32 = 24.0;
+const EXTRAS_TOP: f32 = 272.0;
+
+const VOLUME_TRACK: Rect = Rect::new(104.0, 43.0, 220.0, 47.0);
+const VOLUME_HIT: Rect = Rect::new(96.0, ROW_VOLUME, 230.0, ROW_VOLUME + ROW_H);
+
+/// One interactive element in the flyout. Volume is tracked here too so the
+/// drag and the plain buttons share the same hover/press bookkeeping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Control {
+    Volume,
+    SpeedDown,
+    SpeedUp,
+    Eq,
+    Pitch,
+    SleepOff,
+    Sleep15,
+    Sleep30,
+    Sleep60,
+    CustomDown,
+    CustomUp,
+    AbStart,
+    AbEnd,
+    AbClear,
+    DevicePrev,
+    DeviceNext,
+    OpenSettings,
+    DesktopLyrics,
+    MiniPlayer,
+}
+
+const MAIN_CONTROLS: [Control; 16] = [
+    Control::SpeedDown,
+    Control::SpeedUp,
+    Control::Eq,
+    Control::Pitch,
+    Control::SleepOff,
+    Control::Sleep15,
+    Control::Sleep30,
+    Control::Sleep60,
+    Control::CustomDown,
+    Control::CustomUp,
+    Control::AbStart,
+    Control::AbEnd,
+    Control::AbClear,
+    Control::DevicePrev,
+    Control::DeviceNext,
+    Control::OpenSettings,
+];
+const EXTRA_CONTROLS: [Control; 2] = [Control::DesktopLyrics, Control::MiniPlayer];
+
+fn button_top(row: f32) -> f32 {
+    row + (ROW_H - CONTROL_H) * 0.5
+}
+
+fn button_rect(row: f32, left: f32, right: f32) -> Rect {
+    let top = button_top(row);
+    Rect::new(left, top, right, top + CONTROL_H)
+}
+
+fn segmented_rect(row: f32, index: usize) -> Rect {
+    let gap = 3.0;
+    let width = (RIGHT - CONTROL_X - gap * 3.0) / 4.0;
+    let left = CONTROL_X + index as f32 * (width + gap);
+    button_rect(row, left, left + width)
+}
+
+fn control_rect(control: Control) -> Rect {
+    match control {
+        Control::Volume => VOLUME_HIT,
+        Control::SpeedDown => button_rect(ROW_SPEED, 196.0, 224.0),
+        Control::SpeedUp => button_rect(ROW_SPEED, 258.0, RIGHT),
+        Control::Eq => button_rect(ROW_EQ, 200.0, RIGHT),
+        Control::Pitch => button_rect(ROW_PITCH, 200.0, RIGHT),
+        Control::SleepOff => segmented_rect(ROW_SLEEP, 0),
+        Control::Sleep15 => segmented_rect(ROW_SLEEP, 1),
+        Control::Sleep30 => segmented_rect(ROW_SLEEP, 2),
+        Control::Sleep60 => segmented_rect(ROW_SLEEP, 3),
+        Control::CustomDown => button_rect(ROW_CUSTOM, CONTROL_X, 132.0),
+        Control::CustomUp => button_rect(ROW_CUSTOM, 258.0, RIGHT),
+        Control::AbStart
+        | Control::AbEnd
+        | Control::AbClear => {
+            let gap = 3.0;
+            let width = (RIGHT - CONTROL_X - gap * 2.0) / 3.0;
+            let slot = match control {
+                Control::AbStart => 0,
+                Control::AbEnd => 1,
+                _ => 2,
+            };
+            let left = CONTROL_X + slot as f32 * (width + gap);
+            button_rect(ROW_AB, left, left + width)
+        }
+        Control::DevicePrev => button_rect(ROW_DEVICE, CONTROL_X, 132.0),
+        Control::DeviceNext => button_rect(ROW_DEVICE, 258.0, RIGHT),
+        Control::OpenSettings => Rect::new(LEFT, ROW_LINK, RIGHT, ROW_LINK + LINK_H),
+        Control::DesktopLyrics => {
+            let top = EXTRAS_TOP;
+            Rect::new(LEFT, top, RIGHT, top + CONTROL_H)
+        }
+        Control::MiniPlayer => {
+            let top = EXTRAS_TOP + ROW_H;
+            Rect::new(LEFT, top, RIGHT, top + CONTROL_H)
+        }
+    }
+}
 
 struct State {
     parent: HWND,
@@ -70,12 +205,16 @@ struct State {
     pitch: bool,
     volume: f32,
     muted: bool,
+    sleep_minutes: Option<u32>,
+    ab_start: Option<f64>,
+    ab_end: Option<f64>,
+    device: Option<String>,
     /// Narrow window: show the functions hidden from the player bar.
     narrow: bool,
     desktop_open: bool,
     mini_open: bool,
-    hover: Option<usize>,
-    pressed: Option<usize>,
+    hover: Option<Control>,
+    pressed: Option<Control>,
     dragging_volume: bool,
     back_dc: Option<HDC>,
     back_bitmap: Option<HBITMAP>,
@@ -98,6 +237,10 @@ impl State {
             pitch: true,
             volume: 1.0,
             muted: false,
+            sleep_minutes: None,
+            ab_start: None,
+            ab_end: None,
+            device: None,
             narrow: false,
             desktop_open: false,
             mini_open: false,
@@ -136,27 +279,71 @@ impl State {
         self.pressed = None;
     }
 
-    fn controls() -> [Rect; CONTROL_COUNT] {
-        [
-            Rect::new(160.0, 74.0, 188.0, 102.0),  // speed -
-            Rect::new(218.0, 74.0, 246.0, 102.0),  // speed +
-            Rect::new(178.0, 108.0, 246.0, 136.0), // equalizer
-            Rect::new(178.0, 142.0, 246.0, 170.0), // pitch preserve
-            Rect::new(14.0, 176.0, 246.0, 200.0),  // open settings page
-        ]
-    }
-
-    /// Rows that only exist when the player bar hides these functions
-    /// (narrow window). They are still disabled until the overlays are wired.
-    fn extras() -> [Rect; 2] {
-        [
-            Rect::new(14.0, 206.0, 246.0, 230.0),
-            Rect::new(14.0, 234.0, 246.0, 258.0),
-        ]
-    }
-
     fn invalidate(&self, hwnd: HWND) {
         let _ = unsafe { windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false) };
+    }
+
+    fn control_active(&self, control: Control) -> bool {
+        match control {
+            Control::Eq => self.eq,
+            Control::Pitch => self.pitch,
+            Control::SleepOff => self.sleep_minutes.is_none(),
+            Control::Sleep15 => self.sleep_minutes == Some(15),
+            Control::Sleep30 => self.sleep_minutes == Some(30),
+            Control::Sleep60 => self.sleep_minutes == Some(60),
+            Control::AbStart => self.ab_start.is_some(),
+            Control::AbEnd => self.ab_end.is_some(),
+            Control::AbClear => self.ab_start.is_some() || self.ab_end.is_some(),
+            Control::DesktopLyrics => self.desktop_open,
+            Control::MiniPlayer => self.mini_open,
+            _ => false,
+        }
+    }
+
+    fn control_label(&self, control: Control) -> String {
+        match control {
+            Control::SpeedDown | Control::CustomDown | Control::DevicePrev => "−".to_string(),
+            Control::SpeedUp | Control::CustomUp | Control::DeviceNext => "+".to_string(),
+            Control::Eq => toggle_label(self.eq),
+            Control::Pitch => toggle_label(self.pitch),
+            Control::SleepOff => "关闭".to_string(),
+            Control::Sleep15 => "15 分".to_string(),
+            Control::Sleep30 => "30 分".to_string(),
+            Control::Sleep60 => "60 分".to_string(),
+            Control::AbStart => match self.ab_start {
+                Some(secs) => format!("A {}", format_time(secs)),
+                None => "设 A".to_string(),
+            },
+            Control::AbEnd => match self.ab_end {
+                Some(secs) => format!("B {}", format_time(secs)),
+                None => "设 B".to_string(),
+            },
+            Control::AbClear => "清除".to_string(),
+            Control::OpenSettings => "打开设置页 ›".to_string(),
+            Control::DesktopLyrics => "桌面歌词".to_string(),
+            Control::MiniPlayer => "迷你播放器".to_string(),
+            Control::Volume => String::new(),
+        }
+    }
+
+    fn control_at(&self, x: f32, y: f32) -> Option<Control> {
+        if VOLUME_HIT.contains(x, y) {
+            return Some(Control::Volume);
+        }
+        if let Some(control) = MAIN_CONTROLS
+            .iter()
+            .copied()
+            .find(|control| control_rect(*control).contains(x, y))
+        {
+            return Some(control);
+        }
+        if self.narrow {
+            return EXTRA_CONTROLS
+                .iter()
+                .copied()
+                .find(|control| control_rect(*control).contains(x, y));
+        }
+        None
     }
 
     fn paint(&mut self, hwnd: HWND, hdc: HDC) {
@@ -173,29 +360,57 @@ impl State {
         unsafe {
             SetBkMode(back, TRANSPARENT);
         }
-        self.fill(back, Rect::new(0.0, 0.0, width as f32 / scale, height as f32 / scale), self.palette.panel, scale);
+        self.fill(
+            back,
+            Rect::new(0.0, 0.0, width as f32 / scale, height as f32 / scale),
+            self.palette.panel,
+            scale,
+        );
         // 1 DIP border.
-        self.fill(back, Rect::new(0.0, 0.0, width as f32 / scale, 1.0), self.palette.divider, scale);
         self.fill(
             back,
-            Rect::new(0.0, height as f32 / scale - 1.0, width as f32 / scale, height as f32 / scale),
+            Rect::new(0.0, 0.0, width as f32 / scale, 1.0),
             self.palette.divider,
             scale,
         );
-        self.fill(back, Rect::new(0.0, 0.0, 1.0, height as f32 / scale), self.palette.divider, scale);
         self.fill(
             back,
-            Rect::new(width as f32 / scale - 1.0, 0.0, width as f32 / scale, height as f32 / scale),
+            Rect::new(
+                0.0,
+                height as f32 / scale - 1.0,
+                width as f32 / scale,
+                height as f32 / scale,
+            ),
             self.palette.divider,
             scale,
         );
+        self.fill(
+            back,
+            Rect::new(0.0, 0.0, 1.0, height as f32 / scale),
+            self.palette.divider,
+            scale,
+        );
+        self.fill(
+            back,
+            Rect::new(
+                width as f32 / scale - 1.0,
+                0.0,
+                width as f32 / scale,
+                height as f32 / scale,
+            ),
+            self.palette.divider,
+            scale,
+        );
+
+        let rect = |left: f32, top: f32, right: f32, bottom: f32| Rect::new(left, top, right, bottom);
+        let row_rect = |row: f32| rect(LEFT, row, RIGHT, row + ROW_H);
 
         self.text(
             back,
             13.0,
             true,
             "播放设置",
-            Rect::new(14.0, 10.0, 246.0, 34.0),
+            rect(LEFT, 6.0, RIGHT, 32.0),
             self.palette.text,
             DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
@@ -208,7 +423,7 @@ impl State {
             11.5,
             false,
             "音量",
-            Rect::new(14.0, 40.0, 86.0, 68.0),
+            row_rect(ROW_VOLUME),
             self.palette.text,
             DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
@@ -220,17 +435,21 @@ impl State {
         self.fill(
             back,
             Rect::new(track.left, track.top, fill_right, track.bottom),
-            if self.muted { self.palette.muted } else { self.palette.accent_text },
+            if self.muted {
+                self.palette.muted
+            } else {
+                self.palette.accent_text
+            },
             scale,
         );
-        let knob_color = if self.dragging_volume || self.hover == Some(VOLUME_CONTROL) {
+        let knob_color = if self.dragging_volume || self.hover == Some(Control::Volume) {
             self.palette.text
         } else {
             self.palette.accent_text
         };
         self.fill(
             back,
-            Rect::new(fill_right - 1.5, 46.0, fill_right + 1.5, 62.0),
+            Rect::new(fill_right - 1.5, track.top - 3.0, fill_right + 1.5, track.bottom + 3.0),
             knob_color,
             scale,
         );
@@ -244,105 +463,117 @@ impl State {
             11.5,
             false,
             &volume_text,
-            Rect::new(214.0, 40.0, 246.0, 68.0),
-            if self.muted { self.palette.muted } else { self.palette.accent_text },
+            rect(230.0, ROW_VOLUME, RIGHT, ROW_VOLUME + ROW_H),
+            if self.muted {
+                self.palette.muted
+            } else {
+                self.palette.accent_text
+            },
             DT_RIGHT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
         );
 
-        let controls = Self::controls();
-        self.text(
-            back,
-            11.5,
-            false,
-            "播放速度",
-            Rect::new(14.0, 74.0, 120.0, 102.0),
-            self.palette.text,
-            DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
-            scale,
-        );
-        self.button(back, 0, controls[0], "−", false, scale);
+        // Playback speed.
+        self.row_label(back, "播放速度", ROW_SPEED, scale);
+        self.button(back, Control::SpeedDown, scale);
         self.text(
             back,
             11.5,
             false,
             &format!("{:.2}×", self.speed),
-            Rect::new(188.0, 74.0, 218.0, 102.0),
+            rect(224.0, ROW_SPEED, 258.0, ROW_SPEED + ROW_H),
             self.palette.accent_text,
             DT_CENTER.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
         );
-        self.button(back, 1, controls[1], "+", false, scale);
+        self.button(back, Control::SpeedUp, scale);
 
+        self.row_label(back, "均衡器", ROW_EQ, scale);
+        self.button(back, Control::Eq, scale);
+
+        self.row_label(back, "保持音高", ROW_PITCH, scale);
+        self.button(back, Control::Pitch, scale);
+
+        self.row_label(back, "睡眠定时", ROW_SLEEP, scale);
+        self.button(back, Control::SleepOff, scale);
+        self.button(back, Control::Sleep15, scale);
+        self.button(back, Control::Sleep30, scale);
+        self.button(back, Control::Sleep60, scale);
+
+        self.row_label(back, "自定义睡眠", ROW_CUSTOM, scale);
+        self.button(back, Control::CustomDown, scale);
         self.text(
             back,
             11.5,
             false,
-            "均衡器",
-            Rect::new(14.0, 108.0, 120.0, 136.0),
-            self.palette.text,
-            DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
+            &match self.sleep_minutes {
+                Some(minutes) => format!("{minutes} 分钟"),
+                None => "关闭".to_string(),
+            },
+            rect(132.0, ROW_CUSTOM, 258.0, ROW_CUSTOM + ROW_H),
+            if self.sleep_minutes.is_some() {
+                self.palette.accent_text
+            } else {
+                self.palette.muted
+            },
+            DT_CENTER.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
         );
-        self.button(
-            back,
-            2,
-            controls[2],
-            if self.eq { "开" } else { "关" },
-            self.eq,
-            scale,
-        );
+        self.button(back, Control::CustomUp, scale);
 
+        self.row_label(back, "A-B 循环", ROW_AB, scale);
+        self.button(back, Control::AbStart, scale);
+        self.button(back, Control::AbEnd, scale);
+        self.button(back, Control::AbClear, scale);
+
+        self.row_label(back, "输出设备", ROW_DEVICE, scale);
+        self.button(back, Control::DevicePrev, scale);
+        let device_text = self
+            .device
+            .clone()
+            .unwrap_or_else(|| "系统默认".to_string());
+        let device_active = self.device.is_some();
         self.text(
             back,
             11.5,
             false,
-            "保持音高",
-            Rect::new(14.0, 142.0, 120.0, 170.0),
-            self.palette.text,
-            DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
+            &device_text,
+            rect(132.0, ROW_DEVICE, 258.0, ROW_DEVICE + ROW_H),
+            if device_active {
+                self.palette.accent_text
+            } else {
+                self.palette.muted
+            },
+            DT_CENTER.0
+                | DT_SINGLELINE.0
+                | DT_VCENTER.0
+                | DT_NOPREFIX.0
+                | DT_END_ELLIPSIS.0,
             scale,
         );
-        self.button(
-            back,
-            3,
-            controls[3],
-            if self.pitch { "开" } else { "关" },
-            self.pitch,
-            scale,
-        );
+        self.button(back, Control::DeviceNext, scale);
 
-        let hovered = self.hover == Some(4);
+        let hovered = self.hover == Some(Control::OpenSettings);
         self.text(
             back,
             11.5,
             false,
             "打开设置页 ›",
-            controls[4],
-            if hovered { self.palette.accent_text } else { self.palette.muted },
+            control_rect(Control::OpenSettings),
+            if hovered {
+                self.palette.accent_text
+            } else {
+                self.palette.muted
+            },
             DT_RIGHT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
         );
 
         // Narrow window: the player bar hides these buttons; show the same
-        // toggles here so they stay reachable at 640 DIP.
+        // toggles here so they stay reachable.
         if self.narrow {
-            let rows = [
-                ("桌面歌词", self.desktop_open, 6usize),
-                ("迷你播放器", self.mini_open, 7usize),
-            ];
-            for (row, (label, active, index)) in Self::extras().into_iter().zip(rows) {
-                self.button(back, index, row, label, active, scale);
-                self.text(
-                    back,
-                    10.5,
-                    false,
-                    if active { "开" } else { "关" },
-                    row.inset(8.0, 0.0),
-                    if active { self.palette.accent_text } else { self.palette.muted },
-                    DT_RIGHT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
-                    scale,
-                );
+            for control in EXTRA_CONTROLS {
+                self.extra_button(back, control, scale);
             }
         }
 
@@ -352,18 +583,25 @@ impl State {
         }
     }
 
-    fn button(
-        &mut self,
-        hdc: HDC,
-        index: usize,
-        area: Rect,
-        label: &str,
-        active: bool,
-        scale: f32,
-    ) {
-        let state = if self.pressed == Some(index) {
+    fn row_label(&mut self, hdc: HDC, label: &str, row: f32, scale: f32) {
+        self.text(
+            hdc,
+            11.5,
+            false,
+            label,
+            Rect::new(LEFT, row, LABEL_RIGHT, row + ROW_H),
+            self.palette.text,
+            DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
+            scale,
+        );
+    }
+
+    fn button(&mut self, hdc: HDC, control: Control, scale: f32) {
+        let area = control_rect(control);
+        let active = self.control_active(control);
+        let state = if self.pressed == Some(control) {
             ButtonState::Pressed
-        } else if self.hover == Some(index) {
+        } else if self.hover == Some(control) {
             if active {
                 ButtonState::HoverActive
             } else {
@@ -382,18 +620,78 @@ impl State {
             ButtonState::Active => self.palette.button_active,
         };
         self.fill(hdc, area, background, scale);
+        let label = self.control_label(control);
         self.text(
             hdc,
             11.5,
             false,
-            label,
-            area,
+            &label,
+            area.inset(4.0, 0.0),
             match state {
                 ButtonState::Normal => self.palette.muted,
                 ButtonState::Pressed | ButtonState::HoverActive => self.palette.accent_text,
                 _ => self.palette.text,
             },
-            DT_CENTER.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
+            DT_CENTER.0
+                | DT_SINGLELINE.0
+                | DT_VCENTER.0
+                | DT_NOPREFIX.0
+                | DT_END_ELLIPSIS.0,
+            scale,
+        );
+    }
+
+    fn extra_button(&mut self, hdc: HDC, control: Control, scale: f32) {
+        let area = control_rect(control);
+        let active = self.control_active(control);
+        let state = if self.pressed == Some(control) {
+            ButtonState::Pressed
+        } else if self.hover == Some(control) {
+            if active {
+                ButtonState::HoverActive
+            } else {
+                ButtonState::Hover
+            }
+        } else if active {
+            ButtonState::Active
+        } else {
+            ButtonState::Normal
+        };
+        let background = match state {
+            ButtonState::Normal => self.palette.button_bg,
+            ButtonState::Hover => self.palette.button_hover,
+            ButtonState::HoverActive => self.palette.button_active,
+            ButtonState::Pressed => self.palette.button_pressed,
+            ButtonState::Active => self.palette.button_active,
+        };
+        self.fill(hdc, area, background, scale);
+        let color = match state {
+            ButtonState::Normal => self.palette.muted,
+            ButtonState::Pressed | ButtonState::HoverActive => self.palette.accent_text,
+            _ => self.palette.text,
+        };
+        self.text(
+            hdc,
+            11.5,
+            false,
+            &self.control_label(control),
+            area.inset(10.0, 0.0),
+            color,
+            DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
+            scale,
+        );
+        self.text(
+            hdc,
+            10.5,
+            false,
+            if active { "开" } else { "关" },
+            area.inset(10.0, 0.0),
+            if active {
+                self.palette.accent_text
+            } else {
+                self.palette.muted
+            },
+            DT_RIGHT.0 | DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0,
             scale,
         );
     }
@@ -421,23 +719,7 @@ impl State {
             self.invalidate(hwnd);
             return;
         }
-        let hover = if VOLUME_HIT.contains(x, y) {
-            Some(VOLUME_CONTROL)
-        } else {
-            let controls = Self::controls();
-            controls
-                .iter()
-                .position(|rect| rect.contains(x, y))
-                .or_else(|| {
-                    if !self.narrow {
-                        return None;
-                    }
-                    Self::extras()
-                        .iter()
-                        .position(|rect| rect.contains(x, y))
-                        .map(|index| index + 6)
-                })
-        };
+        let hover = self.control_at(x, y);
         if hover != self.hover {
             self.hover = hover;
             self.invalidate(hwnd);
@@ -447,7 +729,7 @@ impl State {
     fn on_press(&mut self, hwnd: HWND, x: f32, y: f32) {
         if VOLUME_HIT.contains(x, y) {
             self.dragging_volume = true;
-            self.hover = Some(VOLUME_CONTROL);
+            self.hover = Some(Control::Volume);
             unsafe {
                 SetCapture(hwnd);
             }
@@ -455,16 +737,7 @@ impl State {
             self.invalidate(hwnd);
             return;
         }
-        let controls = Self::controls();
-        let pressed = controls.iter().position(|rect| rect.contains(x, y)).or_else(|| {
-            if !self.narrow {
-                return None;
-            }
-            Self::extras()
-                .iter()
-                .position(|rect| rect.contains(x, y))
-                .map(|index| index + 6)
-        });
+        let pressed = self.control_at(x, y);
         if pressed != self.pressed {
             self.pressed = pressed;
             self.invalidate(hwnd);
@@ -480,16 +753,7 @@ impl State {
             self.invalidate(hwnd);
             return;
         }
-        let controls = Self::controls();
-        let hit = controls.iter().position(|rect| rect.contains(x, y)).or_else(|| {
-            if !self.narrow {
-                return None;
-            }
-            Self::extras()
-                .iter()
-                .position(|rect| rect.contains(x, y))
-                .map(|index| index + 6)
-        });
+        let hit = self.control_at(x, y);
         let pressed = self.pressed.take();
         self.invalidate(hwnd);
         let Some(pressed) = pressed else {
@@ -498,22 +762,15 @@ impl State {
         if hit != Some(pressed) {
             return;
         }
-        let action = match pressed {
-            0 => ACTION_SPEED_DOWN,
-            1 => ACTION_SPEED_UP,
-            2 => ACTION_TOGGLE_EQ,
-            3 => ACTION_TOGGLE_PITCH,
-            4 => ACTION_OPEN_SETTINGS,
-            6 => ACTION_TOGGLE_DESKTOP_LYRICS,
-            7 => ACTION_TOGGLE_MINI_PLAYER,
-            _ => return,
+        let Some((action, data)) = action_for(pressed) else {
+            return;
         };
         unsafe {
             let _ = PostMessageW(
                 Some(self.parent),
                 WM_APP_PLAYER_ACTION,
                 WPARAM(action),
-                LPARAM(0),
+                LPARAM(data),
             );
         }
     }
@@ -654,6 +911,34 @@ impl State {
     }
 }
 
+fn toggle_label(on: bool) -> String {
+    if on { "开" } else { "关" }.to_string()
+}
+
+fn action_for(control: Control) -> Option<(usize, isize)> {
+    match control {
+        Control::SpeedDown => Some((ACTION_SPEED_DOWN, 0)),
+        Control::SpeedUp => Some((ACTION_SPEED_UP, 0)),
+        Control::Eq => Some((ACTION_TOGGLE_EQ, 0)),
+        Control::Pitch => Some((ACTION_TOGGLE_PITCH, 0)),
+        Control::SleepOff => Some((ACTION_SET_SLEEP, 0)),
+        Control::Sleep15 => Some((ACTION_SET_SLEEP, 15)),
+        Control::Sleep30 => Some((ACTION_SET_SLEEP, 30)),
+        Control::Sleep60 => Some((ACTION_SET_SLEEP, 60)),
+        Control::CustomDown => Some((ACTION_SLEEP_CUSTOM_DELTA, -5)),
+        Control::CustomUp => Some((ACTION_SLEEP_CUSTOM_DELTA, 5)),
+        Control::AbStart => Some((ACTION_AB_START, 0)),
+        Control::AbEnd => Some((ACTION_AB_END, 0)),
+        Control::AbClear => Some((ACTION_AB_CLEAR, 0)),
+        Control::DevicePrev => Some((ACTION_DEVICE_DELTA, -1)),
+        Control::DeviceNext => Some((ACTION_DEVICE_DELTA, 1)),
+        Control::OpenSettings => Some((ACTION_OPEN_SETTINGS, 0)),
+        Control::DesktopLyrics => Some((ACTION_TOGGLE_DESKTOP_LYRICS, 0)),
+        Control::MiniPlayer => Some((ACTION_TOGGLE_MINI_PLAYER, 0)),
+        Control::Volume => None,
+    }
+}
+
 impl Drop for State {
     fn drop(&mut self) {
         self.release_back_buffer();
@@ -747,6 +1032,10 @@ impl PlayerPanel {
             state.pitch = playback.pitch_preserve;
             changed = true;
         }
+        if state.device != playback.device {
+            state.device = playback.device.clone();
+            changed = true;
+        }
         let snapshot = app.core.snapshot();
         if !state.dragging_volume && (state.volume - snapshot.volume).abs() > 0.001 {
             state.volume = snapshot.volume;
@@ -756,7 +1045,18 @@ impl PlayerPanel {
             state.muted = snapshot.muted;
             changed = true;
         }
-        let narrow = app.layout.desktop_lyrics.width() <= 0.0;
+        if state.sleep_minutes != snapshot.sleep_minutes {
+            state.sleep_minutes = snapshot.sleep_minutes;
+            changed = true;
+        }
+        if state.ab_start != snapshot.ab_start || state.ab_end != snapshot.ab_end {
+            state.ab_start = snapshot.ab_start;
+            state.ab_end = snapshot.ab_end;
+            changed = true;
+        }
+        // The extra rows only exist when the layout actually reserved space
+        // for them (narrow windows with enough vertical room).
+        let narrow = app.layout.player_panel.height() > PANEL_BASE_HEIGHT + 1.0;
         if state.narrow != narrow {
             state.narrow = narrow;
             changed = true;
@@ -861,4 +1161,3 @@ unsafe extern "system" fn child_proc(
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
-

@@ -1132,7 +1132,9 @@ impl PreparedRow {
             rt,
             self.main.clone(),
             fill.clone(),
-            is_active,
+            // Outline/shadow are surface-wide settings: the previous/next
+            // rows must look like the current line, not lose their treatment.
+            true,
             text_x,
             y,
             settings.outline,
@@ -1181,7 +1183,9 @@ impl PreparedRow {
                     rt,
                     translation.clone(),
                     brush,
-                    is_active,
+                    // Same rule as the main row: the translation of a
+                    // previous/next line keeps its outline/shadow.
+                    true,
                     x,
                     ty,
                     settings.translation_outline,

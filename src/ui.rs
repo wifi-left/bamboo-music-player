@@ -63,6 +63,8 @@ pub enum Target {
     SettingsColor(usize),
     /// Action button row (file/font picker or direct action).
     SettingsAction(usize),
+    /// Trailing "restore default" chip on an action row (custom font family).
+    SettingsActionReset(usize),
     /// Inline text row.
     SettingsText(usize),
     /// Settings page scrollbar for the generic rows.

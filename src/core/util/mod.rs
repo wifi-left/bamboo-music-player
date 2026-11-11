@@ -57,8 +57,11 @@ pub fn open_in_explorer(path: &Path) {
 pub fn reveal_in_explorer(path: &Path) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        // Explorer reparses the command line itself, so the path must be
+        // quoted or a name with spaces falls back to the Documents folder.
         let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .raw_arg(format!("/select,\"{}\"", path.display()))
             .spawn();
     }
     #[cfg(not(windows))]

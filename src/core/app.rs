@@ -1171,6 +1171,16 @@ impl AppCore {
                 self.session_dirty = true;
             }
             Command::SetPage(page) => {
+                // Leaving the duplicate page must stop a fingerprint scan:
+                // it decodes the whole library on the DB worker and would
+                // otherwise starve every query on the page we switched to.
+                if self.session.page == Page::Duplicates && page != Page::Duplicates {
+                    self.library.db.cancel_duplicates();
+                    if self.library.loading {
+                        self.library.loading = false;
+                        self.library_rev = self.library_rev.wrapping_add(1);
+                    }
+                }
                 self.session.page = page;
                 self.session_dirty = true;
                 if page == Page::Statistics {

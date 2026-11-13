@@ -4,6 +4,7 @@
 //! produces CPU-side RGBA images that the UI layer uploads.
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory,
@@ -77,6 +78,7 @@ fn decode_wic_square(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
         Some(RgbaImage {
             size: [target as usize, target as usize],
             pixels,
+            id: next_image_id(),
         })
     }
 }
@@ -146,6 +148,17 @@ fn decode_limited(bytes: &[u8]) -> Option<image::DynamicImage> {
 pub struct RgbaImage {
     pub size: [usize; 2],
     pub pixels: Vec<u8>,
+    /// Process-unique identity for UI-side caches. `Clone` keeps the id
+    /// because the clone carries the same pixels; a freshly decoded image gets
+    /// a new id, so caches keyed by it can never reuse a freed buffer's entry
+    /// (the old pointer-based keys did, showing another song's cover).
+    pub id: u64,
+}
+
+static NEXT_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_image_id() -> u64 {
+    NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl RgbaImage {
@@ -153,6 +166,7 @@ impl RgbaImage {
         Self {
             size,
             pixels: pixels.to_vec(),
+            id: next_image_id(),
         }
     }
 }

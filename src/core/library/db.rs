@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -347,7 +347,9 @@ enum DbRequest {
     },
     Stats,
     Optimize,
-    Duplicates(DedupeMode),
+    /// `generation` lets a newer duplicate query (or any ordinary DB request)
+    /// abort an in-flight fingerprint scan instead of waiting minutes for it.
+    Duplicates { mode: DedupeMode, generation: u64 },
     ClearFingerprints,
     Missing,
     CheckMissing,
@@ -372,6 +374,8 @@ pub struct LibraryDb {
     events: Receiver<DbEvent>,
     /// Shared with the worker; checked between files while indexing.
     index_cancel: Arc<AtomicBool>,
+    /// Bumped whenever a new request must preempt a running fingerprint scan.
+    duplicate_generation: Arc<AtomicU64>,
     _thread: Option<std::thread::JoinHandle<()>>,
     _forward: Option<std::thread::JoinHandle<()>>,
 }
@@ -390,6 +394,7 @@ impl LibraryDb {
             requests,
             events,
             index_cancel: Arc::new(AtomicBool::new(true)),
+            duplicate_generation: Arc::new(AtomicU64::new(0)),
             _thread: None,
             _forward: None,
         }
@@ -419,6 +424,8 @@ impl LibraryDb {
             .expect("library event thread");
         let index_cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = index_cancel.clone();
+        let duplicate_generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = duplicate_generation.clone();
         let thread = std::thread::Builder::new()
             .name("bamboo-library-db".to_string())
             .spawn(move || {
@@ -444,19 +451,42 @@ impl LibraryDb {
                         None
                     }
                 };
-                run_worker(connection, request_rx, raw_tx, worker_cancel);
+                run_worker(connection, request_rx, raw_tx, worker_cancel, worker_generation);
             })
             .expect("library db thread");
         Self {
             requests,
             events,
             index_cancel,
+            duplicate_generation,
             _thread: Some(thread),
             _forward: Some(forward),
         }
     }
 
     fn send(&self, request: DbRequest) {
+        // User-visible queries (paging, search, sort, indexing) must not sit
+        // behind a fingerprint scan, which decodes every file in the library.
+        // Bumping the generation cancels that scan at the next file boundary.
+        // Background bookkeeping (play counts, upserts) does not preempt it:
+        // those requests can wait and their Done events do not clear the
+        // duplicate page's loading state.
+        let preempts = matches!(
+            &request,
+            DbRequest::Query { .. }
+                | DbRequest::QueryAll { .. }
+                | DbRequest::Smart { .. }
+                | DbRequest::Missing
+                | DbRequest::CheckMissing
+                | DbRequest::Optimize
+                | DbRequest::ClearFingerprints
+                | DbRequest::IndexRoots { .. }
+                | DbRequest::IndexPaths(_)
+                | DbRequest::RemoveKeys(_)
+        );
+        if preempts {
+            self.duplicate_generation.fetch_add(1, Ordering::SeqCst);
+        }
         let _ = self.requests.send(request);
     }
 
@@ -499,7 +529,14 @@ impl LibraryDb {
     }
 
     pub fn duplicates(&self, mode: DedupeMode) {
-        self.send(DbRequest::Duplicates(mode));
+        let generation = self.duplicate_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.requests.send(DbRequest::Duplicates { mode, generation });
+    }
+
+    /// Abort an in-flight fingerprint scan. Its partial result is discarded
+    /// and cached fingerprints are kept, so the next scan resumes quickly.
+    pub fn cancel_duplicates(&self) {
+        self.duplicate_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn clear_fingerprints(&self) {
@@ -562,6 +599,7 @@ fn run_worker(
     requests: Receiver<DbRequest>,
     events: Sender<DbEvent>,
     index_cancel: Arc<AtomicBool>,
+    duplicate_generation: Arc<AtomicU64>,
 ) {
     let Some(connection) = connection else {
         // Drain requests so senders never block; every operation is a no-op.
@@ -569,7 +607,13 @@ fn run_worker(
         return;
     };
     while let Ok(request) = requests.recv() {
-        let result = handle(&connection, request, &events, &index_cancel);
+        let result = handle(
+            &connection,
+            request,
+            &events,
+            &index_cancel,
+            &duplicate_generation,
+        );
         if let Err(err) = result {
             tracing::warn!("library db request failed: {err}");
             let _ = events.send(DbEvent::Error(crate::trf!("曲库操作失败：{}", err)));
@@ -582,6 +626,7 @@ fn handle(
     request: DbRequest,
     events: &Sender<DbEvent>,
     index_cancel: &AtomicBool,
+    duplicate_generation: &AtomicU64,
 ) -> rusqlite::Result<()> {
     match request {
         DbRequest::IndexRoots {
@@ -650,9 +695,15 @@ fn handle(
             let stats = run_stats(conn)?;
             let _ = events.send(DbEvent::MaintenanceDone(Box::new(stats)));
         }
-        DbRequest::Duplicates(mode) => {
-            let groups = run_duplicates(conn, mode)?;
-            let _ = events.send(DbEvent::DuplicatesDone(groups));
+        DbRequest::Duplicates { mode, generation } => {
+            let groups = run_duplicates(conn, mode, duplicate_generation, generation)?;
+            // A canceled/superseded scan must not clobber the rows of the
+            // request that replaced it.
+            if let Some(groups) = groups
+                && duplicate_generation.load(Ordering::SeqCst) == generation
+            {
+                let _ = events.send(DbEvent::DuplicatesDone(groups));
+            }
         }
         DbRequest::ClearFingerprints => {
             conn.execute("DELETE FROM fingerprints", [])?;
@@ -1225,11 +1276,20 @@ fn run_stats(conn: &Connection) -> rusqlite::Result<LibraryStats> {
     Ok(stats)
 }
 
-fn run_duplicates(conn: &Connection, mode: DedupeMode) -> rusqlite::Result<Vec<DuplicateGroup>> {
+/// `None` means the fingerprint scan was superseded and its partial result
+/// must be discarded.
+fn run_duplicates(
+    conn: &Connection,
+    mode: DedupeMode,
+    generation_counter: &AtomicU64,
+    generation: u64,
+) -> rusqlite::Result<Option<Vec<DuplicateGroup>>> {
     match mode {
-        DedupeMode::Metadata => run_duplicates_metadata(conn),
-        DedupeMode::Path => run_duplicates_path(conn),
-        DedupeMode::Fingerprint => run_duplicates_fingerprint(conn),
+        DedupeMode::Metadata => run_duplicates_metadata(conn).map(Some),
+        DedupeMode::Path => run_duplicates_path(conn).map(Some),
+        DedupeMode::Fingerprint => {
+            run_duplicates_fingerprint(conn, generation_counter, generation)
+        }
     }
 }
 
@@ -1309,7 +1369,11 @@ fn run_duplicates_path(conn: &Connection) -> rusqlite::Result<Vec<DuplicateGroup
         .collect())
 }
 
-fn run_duplicates_fingerprint(conn: &Connection) -> rusqlite::Result<Vec<DuplicateGroup>> {
+fn run_duplicates_fingerprint(
+    conn: &Connection,
+    generation_counter: &AtomicU64,
+    generation: u64,
+) -> rusqlite::Result<Option<Vec<DuplicateGroup>>> {
     let entries = query_rows(
         conn,
         &format!("SELECT {COLUMNS} FROM tracks WHERE missing = 0 ORDER BY size DESC, lower(path)"),
@@ -1318,11 +1382,21 @@ fn run_duplicates_fingerprint(conn: &Connection) -> rusqlite::Result<Vec<Duplica
     let mut fingerprints: Vec<Option<crate::audio::fingerprint::Fingerprint>> =
         Vec::with_capacity(entries.len());
     for entry in &entries {
+        // Decoding every file can take minutes on a large library. Abort at a
+        // file boundary as soon as another query needs the database (the UI
+        // navigated away, or the dedupe mode changed). Cached fingerprints are
+        // kept, so the next attempt resumes almost where this one stopped.
+        if generation_counter.load(Ordering::SeqCst) != generation {
+            return Ok(None);
+        }
         fingerprints.push(fingerprint_for_entry(conn, entry));
     }
 
     let mut parent: Vec<usize> = (0..entries.len()).collect();
     for i in 0..entries.len() {
+        if i % 64 == 0 && generation_counter.load(Ordering::SeqCst) != generation {
+            return Ok(None);
+        }
         let Some(first) = fingerprints[i].as_ref() else {
             continue;
         };
@@ -1362,7 +1436,7 @@ fn run_duplicates_fingerprint(conn: &Connection) -> rusqlite::Result<Vec<Duplica
         })
         .collect();
     groups.sort_by(|a, b| b.entries.len().cmp(&a.entries.len()));
-    Ok(groups)
+    Ok(Some(groups))
 }
 
 fn fingerprint_for_entry(
@@ -1510,6 +1584,13 @@ mod tests {
             params![track.key, plays, added, last_played],
         )
         .unwrap();
+    }
+
+    fn duplicates(conn: &Connection, mode: DedupeMode) -> Vec<DuplicateGroup> {
+        let generation = AtomicU64::new(1);
+        run_duplicates(conn, mode, &generation, 1)
+            .unwrap()
+            .expect("scan completed")
     }
 
     #[test]
@@ -1661,7 +1742,7 @@ mod tests {
         assert_eq!(stats.total_plays, 2);
         assert_eq!(stats.top_tracks[0].0, "Song");
 
-        let groups = run_duplicates(&conn, DedupeMode::Metadata).unwrap();
+        let groups = duplicates(&conn, DedupeMode::Metadata);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].entries.len(), 2);
     }
@@ -1675,7 +1756,7 @@ mod tests {
         b.path = PathBuf::from("c:\\MUSIC\\same.MP3");
         seed(&conn, &a, 0, 1, None);
         seed(&conn, &b, 0, 2, None);
-        let groups = run_duplicates(&conn, DedupeMode::Path).unwrap();
+        let groups = duplicates(&conn, DedupeMode::Path);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].entries.len(), 2);
     }
@@ -1715,12 +1796,25 @@ mod tests {
         b.path = second;
         seed(&conn, &a, 0, 1, None);
         seed(&conn, &b, 0, 2, None);
-        let groups = run_duplicates(&conn, DedupeMode::Fingerprint).unwrap();
+        let groups = duplicates(&conn, DedupeMode::Fingerprint);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].entries.len(), 2);
         // Second run uses the cached fingerprint row.
-        let groups = run_duplicates(&conn, DedupeMode::Fingerprint).unwrap();
+        let groups = duplicates(&conn, DedupeMode::Fingerprint);
         assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn fingerprint_scan_aborts_when_a_newer_request_arrives() {
+        let conn = memory_db();
+        let mut a = track("a", "Song", "Artist", 0, 1);
+        // The generation check runs before any file is decoded, so this path
+        // does not need to exist.
+        a.path = PathBuf::from("C:\\music\\a.mp3");
+        seed(&conn, &a, 0, 1, None);
+        let counter = AtomicU64::new(2);
+        let groups = run_duplicates(&conn, DedupeMode::Fingerprint, &counter, 1).unwrap();
+        assert!(groups.is_none());
     }
 
     #[test]

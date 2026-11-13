@@ -4634,6 +4634,9 @@ impl App {
             crate::config::DedupeMode::Path => "文件路径",
             crate::config::DedupeMode::Fingerprint => "音频指纹",
         };
+        if snapshot.library_loading {
+            return format!("查重方式：{mode} · 查询中…");
+        }
         format!(
             "查重方式：{} · {} 组 · {} 个文件",
             mode,

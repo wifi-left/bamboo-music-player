@@ -63,10 +63,10 @@ pub struct Painter {
     /// Changing either clears the font cache once.
     font_family: Option<String>,
     font_scale: f32,
-    /// Converted BGRA pixels for decoded covers, keyed by the image address.
-    /// A cover is decoded once and reused for every paint until the cache is
-    /// trimmed, which keeps per-row thumbnails off the conversion path.
-    images: HashMap<usize, CoverPixels>,
+    /// Converted BGRA pixels for decoded covers, keyed by the image's unique
+    /// id. A cover is decoded once and reused for every paint until the cache
+    /// is trimmed, which keeps per-row thumbnails off the conversion path.
+    images: HashMap<u64, CoverPixels>,
     /// Persistent double buffer: all GDI drawing goes here and only the dirty
     /// bounding box is blitted to the window, so partial repaints never show a
     /// half-drawn frame.
@@ -81,7 +81,7 @@ pub struct Painter {
     /// Small pre-blurred backdrop derived from the current cover. Rebuilt only
     /// when the cover or light/dark choice changes, never per frame.
     background: Option<BackgroundPixels>,
-    background_key: (usize, bool, [u8; 3], i32, i32, u8),
+    background_key: (u64, bool, [u8; 3], i32, i32, u8),
 }
 
 struct BackgroundPixels {
@@ -397,13 +397,13 @@ impl Painter {
     /// current cover. 40×24 pixels stretched with HALFTONE is cheap and hides
     /// the low resolution once it sits behind the UI.
     fn ensure_cover_background(&mut self, app: &App, width_px: i32, height_px: i32) -> bool {
-        let Some((image, rev)) = app.current_cover() else {
+        let Some((image, _)) = app.current_cover() else {
             self.background = None;
             return false;
         };
         let accent = app.core.settings.theme.accent;
         let key = (
-            image as *const RgbaImage as usize ^ rev as usize,
+            image.id,
             self.pal.dark,
             accent,
             width_px,
@@ -522,13 +522,13 @@ impl Painter {
     /// cache the full-size BGRA once. Bilinear sampling runs in parallel rows
     /// so a 4K client is prepared in milliseconds, not seconds.
     fn ensure_user_background(&mut self, app: &App, width_px: i32, height_px: i32) -> bool {
-        let Some((image, rev)) = app.background_image() else {
+        let Some((image, _)) = app.background_image() else {
             self.background = None;
             return false;
         };
         let accent = app.core.settings.theme.accent;
         let key = (
-            image as *const RgbaImage as usize ^ rev as usize,
+            image.id,
             self.pal.dark,
             accent,
             width_px,
@@ -3631,7 +3631,7 @@ impl Painter {
     /// sticker), so keeping it out of `StretchDIBits` saves a full copy per
     /// frame.
     fn cached_cover(&mut self, image: &RgbaImage) -> Option<&CoverPixels> {
-        let key = image as *const RgbaImage as usize;
+        let key = image.id;
         if !self.images.contains_key(&key) {
             let (w, h) = (image.size[0] as i32, image.size[1] as i32);
             if w <= 0 || h <= 0 || image.pixels.len() < (w * h * 4) as usize {

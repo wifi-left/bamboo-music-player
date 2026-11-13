@@ -297,7 +297,7 @@ struct State {
     style: Style,
     /// Decoded picture for the embedded panel, with a cached BGRA copy.
     panel_image: Option<RgbaImage>,
-    panel_image_ptr: usize,
+    panel_image_id: u64,
     panel_image_bgra: Option<(Vec<u8>, i32, i32)>,
     /// Set once a style has been applied; the first sync must repaint.
     styled: bool,
@@ -338,7 +338,7 @@ impl State {
             empty_sub_hint: crate::i18n::tr("拖放或选择 .lrc/.srt 文件").to_string(),
             style: Style::placeholder(),
             panel_image: None,
-            panel_image_ptr: 0,
+            panel_image_id: 0,
             panel_image_bgra: None,
             styled: false,
             visible: false,
@@ -1521,22 +1521,22 @@ impl State {
         }
         if self.style.panel_image_key.is_some() {
             if let Some(image) = snapshot.lyrics_background {
-                let pointer = image as *const RgbaImage as usize;
-                if self.panel_image.is_none() || pointer != self.panel_image_ptr {
+                let id = image.id;
+                if self.panel_image.is_none() || id != self.panel_image_id {
                     self.panel_image = Some(image.clone());
-                    self.panel_image_ptr = pointer;
+                    self.panel_image_id = id;
                     self.panel_image_bgra = None;
                     repaint_all = true;
                 }
             } else if self.panel_image.is_some() {
                 self.panel_image = None;
-                self.panel_image_ptr = 0;
+                self.panel_image_id = 0;
                 self.panel_image_bgra = None;
                 repaint_all = true;
             }
         } else if self.panel_image.is_some() {
             self.panel_image = None;
-            self.panel_image_ptr = 0;
+            self.panel_image_id = 0;
             self.panel_image_bgra = None;
             repaint_all = true;
         }

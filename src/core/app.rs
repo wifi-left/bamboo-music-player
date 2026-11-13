@@ -32,6 +32,7 @@ use crate::playlist::Queue;
 use crate::util::background_image::BackgroundImageService;
 use crate::util::cover::{CoverService, RowCoverService};
 use crate::util::image_util::RgbaImage;
+use crate::web::{WebControlService, WebLyrics, WebState, WebStatus, WebTrack};
 
 /// Default library window size used until the UI reports how many rows fit
 /// on screen. The UI pages the list, so this is only a startup fallback.
@@ -136,6 +137,16 @@ pub enum Command {
     SetCacheLimitMb(u64),
     SetStreamCacheDir(Option<PathBuf>),
     ClearStreamCache,
+    /// Local web control panel (`core::web`). Every change re-applies the
+    /// listener configuration immediately; invalid values surface as a status
+    /// message instead of silently keeping the old server running.
+    SetWebEnabled(bool),
+    SetWebBindAddress(String),
+    SetWebPort(u16),
+    SetWebAccessKey(String),
+    SetWebReadOnly(bool),
+    /// Replace the access key with a fresh random one (keeps the server up).
+    RegenerateWebAccessKey,
     /// Download settings and manager.
     SetDownloadDir(Option<PathBuf>),
     SetDownloadConcurrency(u8),
@@ -624,6 +635,10 @@ pub struct AppCore {
     partial_cleanup: Option<crossbeam_channel::Receiver<usize>>,
     /// Pending `api.info` for online lyrics of the current track.
     online_info: Option<(u64, String)>,
+    /// Opt-in browser control panel (listener + published snapshot).
+    web: WebControlService,
+    /// Queue revision already mirrored into the web snapshot.
+    web_queue_rev: u64,
 }
 
 pub struct Notice {
@@ -937,12 +952,16 @@ impl AppCore {
             dsp_config(&settings),
             wake.clone(),
         );
+        // Move the restored tracks instead of cloning them: `session` stays
+        // alive for the rest of the run, and a duplicate 10k-track queue is
+        // tens of megabytes that serve no purpose.
         let mut queue = Queue::default();
-        queue.add_many(session.queue.iter().cloned());
+        queue.add_many(std::mem::take(&mut session.queue));
         queue.shuffle = session.shuffle;
         queue.repeat = session.repeat;
         if queue.shuffle && !session.shuffle_keys.is_empty() {
-            queue.restore_shuffle_order(&session.shuffle_keys);
+            let keys = std::mem::take(&mut session.shuffle_keys);
+            queue.restore_shuffle_order(&keys);
         }
         // Restore the playlist position by track key: files may have been
         // added/removed, so the old index can point at a different song
@@ -996,6 +1015,10 @@ impl AppCore {
             cache_rev: 0,
             partial_cleanup: None,
             online_info: None,
+            web: WebControlService::new(wake.clone()),
+            // `u64::MAX` forces the first publish to include the restored
+            // queue; `queue_rev` can legitimately still be 0 at startup.
+            web_queue_rev: u64::MAX,
             settings,
             session,
             paths,
@@ -1100,6 +1123,11 @@ impl AppCore {
             Command::Next => self.next_track(),
             Command::Prev => self.prev_track(),
             Command::Stop => {
+                // `AudioEngine::stop` unloads the decoder; drop the gapless
+                // arm and deferred restore as well so a later Play reloads the
+                // current track instead of resuming a closed deck.
+                self.disarm_next();
+                self.deferred_start = None;
                 self.engine.stop();
                 self.playback_state = PlaybackState::Stopped;
                 self.session_dirty = true;
@@ -1329,6 +1357,43 @@ impl AppCore {
                 self.refresh_stream_cache(true);
             }
             Command::ClearStreamCache => self.clear_stream_cache(),
+            Command::SetWebEnabled(enabled) => {
+                self.settings.web.enabled = enabled;
+                // Enabling without a key on a LAN bind would refuse to start;
+                // generate one up front so "turn it on" always works. A key is
+                // harmless on loopback and makes the panel usable from a phone
+                // after switching the bind address.
+                if enabled && self.settings.web.access_key.trim().is_empty() {
+                    self.settings.web.access_key = crate::web::generate_access_key();
+                }
+                self.settings_dirty = true;
+                self.apply_web_settings();
+            }
+            Command::SetWebBindAddress(address) => {
+                self.settings.web.bind_address = address.trim().to_string();
+                self.settings_dirty = true;
+                self.apply_web_settings();
+            }
+            Command::SetWebPort(port) => {
+                self.settings.web.port = port.clamp(1024, u16::MAX);
+                self.settings_dirty = true;
+                self.apply_web_settings();
+            }
+            Command::SetWebAccessKey(key) => {
+                self.settings.web.access_key = key.trim().to_string();
+                self.settings_dirty = true;
+                self.apply_web_settings();
+            }
+            Command::SetWebReadOnly(read_only) => {
+                self.settings.web.read_only = read_only;
+                self.settings_dirty = true;
+                self.apply_web_settings();
+            }
+            Command::RegenerateWebAccessKey => {
+                self.settings.web.access_key = crate::web::generate_access_key();
+                self.settings_dirty = true;
+                self.apply_web_settings();
+            }
             Command::SetDownloadDir(dir) => {
                 self.settings.download.dir = dir.filter(|dir| !dir.as_os_str().is_empty());
                 self.settings_dirty = true;
@@ -2438,6 +2503,145 @@ impl AppCore {
         }
     }
 
+    /// Start the web panel if the saved settings ask for it. Called once by
+    /// the shell after startup; bench/self-test runs never reach this, and
+    /// tests construct `AppCore` without opening a listening socket.
+    pub fn start_web_control(&mut self) {
+        if self.demo.is_some() || !self.settings.web.enabled {
+            return;
+        }
+        self.apply_web_settings();
+    }
+
+    pub fn web_status(&self) -> WebStatus {
+        self.web.status()
+    }
+
+    /// A browser used the panel in the last 30 seconds.
+    pub fn web_active(&self) -> bool {
+        self.web.active()
+    }
+
+    fn apply_web_settings(&mut self) {
+        if self.demo.is_some() {
+            return;
+        }
+        match self.web.apply(&self.settings.web) {
+            Ok(()) => {
+                // Serve a real snapshot immediately; otherwise the first page
+                // load can briefly show the default (empty) state.
+                if self.web.is_running() {
+                    self.publish_web_state(true);
+                }
+            }
+            Err(err) => self.notify(crate::trf!("网页控制启动失败：{}", err), true),
+        }
+    }
+
+    /// Drain browser commands and mirror the UI snapshot into the panel.
+    fn poll_web(&mut self) -> bool {
+        if self.demo.is_some() {
+            return false;
+        }
+        let mut changed = false;
+        let mut handled = false;
+        for command in self.web.take_commands() {
+            self.handle(command);
+            handled = true;
+            changed = true;
+        }
+        if !self.settings.web.enabled || !self.web.is_running() {
+            return changed;
+        }
+        let queue_due = self.web_queue_rev != self.queue_rev;
+        // A command was just executed: publish even inside the throttle window
+        // so the panel sees the new volume/position immediately instead of
+        // snapping back to the previous value on its next poll.
+        if !queue_due && !handled && !self.web.should_publish() {
+            return changed;
+        }
+        self.publish_web_state(queue_due);
+        changed
+    }
+
+    fn publish_web_state(&mut self, with_queue: bool) {
+        let position = self.position_secs().max(0.0);
+        let duration = self.duration_secs().max(0.0);
+        let mut lyrics = WebLyrics::default();
+        if let Some(current) = self.lyrics.as_ref() {
+            let position_ms = (position * 1000.0) as u64;
+            match crate::lyrics::view::current_line(current, position_ms) {
+                Some((index, _)) => {
+                    if index > 0
+                        && let Some(line) = current.lines.get(index - 1)
+                    {
+                        lyrics.prev = line.text.clone();
+                    }
+                    if let Some(line) = current.lines.get(index) {
+                        lyrics.current = line.text.clone();
+                        lyrics.translation = line.translation.clone().unwrap_or_default();
+                    }
+                    if let Some(line) = current.lines.get(index + 1) {
+                        lyrics.next = line.text.clone();
+                    }
+                }
+                None => {
+                    if let Some(line) = current.lines.first() {
+                        lyrics.next = line.text.clone();
+                    }
+                }
+            }
+        }
+        let track = self.current_track.as_ref().map(|track| WebTrack {
+            index: self.queue.current.unwrap_or(0),
+            title: track.display_title(),
+            artist: track.display_artist(),
+            album: track.album.clone(),
+            duration: Some(if duration > 0.0 {
+                duration
+            } else {
+                track.duration.unwrap_or(0.0)
+            }),
+            current: true,
+        });
+        let queue = with_queue.then(|| {
+            self.queue
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, track)| WebTrack {
+                    index,
+                    title: track.display_title(),
+                    artist: track.display_artist(),
+                    album: track.album.clone(),
+                    duration: track.duration,
+                    current: self.queue.current == Some(index),
+                })
+                .collect()
+        });
+        let state = WebState {
+            version: env!("CARGO_PKG_VERSION"),
+            state: crate::web::playback_state_label(self.playback_state).to_string(),
+            position,
+            duration,
+            volume: self.settings.playback.volume,
+            muted: self.settings.playback.muted,
+            shuffle: self.queue.shuffle,
+            repeat: crate::web::repeat_label(self.queue.repeat).to_string(),
+            track,
+            lyrics,
+            queue_len: self.queue.items.len(),
+            current_index: self.queue.current,
+            queue_rev: self.queue_rev,
+            read_only: false,
+            cover_rev: self.cover.rev,
+            has_cover: self.cover.png.is_some(),
+        };
+        let cover = self.cover.png.clone();
+        self.web.publish(state, queue, cover);
+        self.web_queue_rev = self.queue_rev;
+    }
+
     /// Poll background work. Returns true when the visible state changed.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
@@ -2597,6 +2801,7 @@ impl AppCore {
         }
 
         changed |= self.poll_library();
+        changed |= self.poll_web();
         self.maybe_autosave();
         changed
     }
@@ -3107,7 +3312,7 @@ impl AppCore {
                 self.playback_state = PlaybackState::Paused;
                 self.session_dirty = true;
             }
-            PlaybackState::Paused | PlaybackState::Stopped => {
+            PlaybackState::Paused => {
                 if let Some(start) = self.deferred_start.take() {
                     if let Some(index) = self.queue.current {
                         self.load_index(index, start, true);
@@ -3117,6 +3322,19 @@ impl AppCore {
                     self.playback_state = PlaybackState::Playing;
                     self.arm_next();
                 } else if let Some(index) = self
+                    .queue
+                    .current
+                    .or_else(|| (!self.queue.is_empty()).then_some(0))
+                {
+                    self.load_index(index, 0.0, true);
+                }
+            }
+            PlaybackState::Stopped => {
+                // `Command::Stop` closes the decoder, so `engine.play()` is a
+                // no-op here. Reopen the current track; otherwise the button
+                // flips to "playing" while the engine stays silent.
+                self.deferred_start = None;
+                if let Some(index) = self
                     .queue
                     .current
                     .or_else(|| (!self.queue.is_empty()).then_some(0))
@@ -3488,7 +3706,13 @@ impl AppCore {
     /// or unreadable playlist never wipes the live queue.
     /// Parse an `.mp3list` into playable tracks, expanding `#SEARCH#`
     /// directory blocks. Shared by explicit imports and the startup refresh.
-    fn playlist_tracks(&self, path: &Path) -> Option<Vec<Track>> {
+    ///
+    /// `skip` filters out tracks that are already in `Queue::keys` *before*
+    /// their `Track` is built. The startup refresh re-reads a playlist whose
+    /// entries are almost always duplicates, and allocating title/artist/
+    /// album strings for thousands of tracks that are about to be rejected
+    /// costs several megabytes of heap churn on every launch.
+    fn playlist_tracks(&self, path: &Path, skip: Option<&HashSet<String>>) -> Option<Vec<Track>> {
         let parsed = match crate::playlist::mp3list::parse(path) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -3496,8 +3720,21 @@ impl AppCore {
                 return None;
             }
         };
-        let mut tracks: Vec<Track> = parsed.files.into_iter().map(Track::local).collect();
+        let known = |key: &str| skip.is_some_and(|keys| keys.contains(key));
+        let mut saw_entry = false;
+        let mut tracks: Vec<Track> = Vec::new();
+        for file in parsed.files {
+            saw_entry = true;
+            if known(&crate::model::normalize_path(&file)) {
+                continue;
+            }
+            tracks.push(Track::local(file));
+        }
         for url in parsed.urls {
+            saw_entry = true;
+            if known(&format!("url:{}", url.trim())) {
+                continue;
+            }
             tracks.push(Track {
                 source: TrackSource::Url { url: url.clone() },
                 title: url,
@@ -3505,7 +3742,13 @@ impl AppCore {
                 ..Default::default()
             });
         }
-        tracks.extend(parsed.online);
+        for track in parsed.online {
+            saw_entry = true;
+            if known(&track.dedupe_key()) {
+                continue;
+            }
+            tracks.push(track);
+        }
         for dir in &parsed.dirs {
             let extensions = if dir.extensions.is_empty() {
                 self.settings.library.extensions.clone()
@@ -3522,9 +3765,15 @@ impl AppCore {
                 .map(|entry| entry.path().to_path_buf())
                 .collect();
             dir_files.sort();
-            tracks.extend(dir_files.into_iter().map(Track::local));
+            for file in dir_files {
+                saw_entry = true;
+                if known(&crate::model::normalize_path(&file)) {
+                    continue;
+                }
+                tracks.push(Track::local(file));
+            }
         }
-        if tracks.is_empty() {
+        if tracks.is_empty() && !saw_entry {
             tracing::warn!(
                 "playlist {}: no playable tracks ({} missing)",
                 path.display(),
@@ -3532,6 +3781,10 @@ impl AppCore {
             );
             return None;
         }
+        // An empty vector with `skip` means every entry is already queued,
+        // which the startup refresh treats the same as before (it still marks
+        // the shuffle cycle as restored). A genuinely unreadable/empty
+        // playlist returns `None` above.
         Some(tracks)
     }
 
@@ -3539,7 +3792,7 @@ impl AppCore {
     /// queue (and its shuffle cycle / current position) and only append tracks
     /// that were newly scanned into the file. Returns how many were added.
     fn refresh_startup_playlist(&mut self, path: &Path) -> usize {
-        let Some(tracks) = self.playlist_tracks(path) else {
+        let Some(tracks) = self.playlist_tracks(path, Some(&self.queue.keys)) else {
             return 0;
         };
         let mut added = 0;
@@ -3564,7 +3817,7 @@ impl AppCore {
     /// Time offset to restore at startup, but only for the track the saved
     /// position belongs to.
     pub fn import_playlist(&mut self, path: &Path, autoplay: bool) -> usize {
-        let Some(tracks) = self.playlist_tracks(path) else {
+        let Some(tracks) = self.playlist_tracks(path, None) else {
             return 0;
         };
         let resume_key = self
@@ -5479,6 +5732,8 @@ impl AppCore {
 
     /// Install synthetic data for `--bench` (no audio decoding involved).
     pub fn load_demo(&mut self, tracks: Vec<Track>, lyrics: Lyrics) {
+        // Bench/self-test runs must never open a listening socket.
+        self.web.stop();
         self.queue.clear();
         self.queue.add_many(tracks);
         self.queue.repeat = RepeatMode::All;
@@ -6053,6 +6308,7 @@ impl AppCore {
         self.start_library_index();
         self.request_lyrics_background();
         self.request_background_image();
+        self.apply_web_settings();
         self.flush_settings();
     }
 
@@ -6111,45 +6367,47 @@ impl AppCore {
 
     fn build_session(&self) -> Session {
         let shuffle = self.shuffle_snapshot();
-        let mut playlist_shuffle = self.session.playlist_shuffle.clone();
+        // The live session no longer owns the queue (startup moves it into
+        // `Queue`), so this clone is cheap. Building the snapshot by mutating
+        // it avoids cloning the whole queue and the playlist shuffle cache a
+        // second time.
+        let mut session = self.session.clone();
         if let (Some(path), Some((keys, cursor, cursor_key))) =
             (self.session.playlist_path.as_ref(), shuffle.as_ref())
         {
             upsert_playlist_shuffle(
-                &mut playlist_shuffle,
+                &mut session.playlist_shuffle,
                 path,
                 keys.clone(),
                 *cursor,
                 cursor_key.clone(),
             );
         }
-        Session {
-            queue: self.queue.items.clone(),
-            current_index: self.queue.current,
-            // Only the playlist position is remembered (which track), never
-            // the offset inside it; the field stays for session-file
-            // compatibility and is always written as 0.
-            position_secs: 0.0,
-            shuffle: self.queue.shuffle,
-            repeat: self.queue.repeat,
-            volume: self.settings.playback.volume,
-            current_key: self.current_track.as_ref().map(Track::dedupe_key),
-            shuffle_keys: shuffle
-                .as_ref()
-                .map(|(keys, _, _)| keys.clone())
-                .unwrap_or_default(),
-            shuffle_cursor: shuffle.as_ref().map(|(_, cursor, _)| *cursor),
-            playlist_shuffle,
-            // An empty queue must not remember an auto-refresh playlist, or
-            // the next launch would silently restore what the user cleared.
-            playlist_path: if self.queue.is_empty() {
-                None
-            } else {
-                self.session.playlist_path.clone()
-            },
-            saved_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
-            ..self.session.clone()
-        }
+        let shuffle_cursor = shuffle.as_ref().map(|(_, cursor, _)| *cursor);
+        session.queue = self.queue.items.clone();
+        session.current_index = self.queue.current;
+        // Only the playlist position is remembered (which track), never the
+        // offset inside it; the field stays for session-file compatibility
+        // and is always written as 0.
+        session.position_secs = 0.0;
+        session.shuffle = self.queue.shuffle;
+        session.repeat = self.queue.repeat;
+        session.volume = self.settings.playback.volume;
+        session.current_key = self.current_track.as_ref().map(Track::dedupe_key);
+        // Move the freshly built order into the snapshot instead of cloning
+        // it again (`shuffle_snapshot` already returned an owned vector).
+        session.shuffle_keys = shuffle.map(|(keys, _, _)| keys).unwrap_or_default();
+        session.shuffle_cursor = shuffle_cursor;
+        // An empty queue must not remember an auto-refresh playlist, or the
+        // next launch would silently restore what the user cleared.
+        session.playlist_path = if self.queue.is_empty() {
+            None
+        } else {
+            self.session.playlist_path.clone()
+        };
+        session.saved_at =
+            Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        session
     }
 }
 
@@ -6556,6 +6814,35 @@ mod tests {
         let core = AppCore::new(paths, None, false);
         assert_eq!(core.snapshot().current_index, Some(0));
         assert_eq!(core.snapshot().current.unwrap().dedupe_key(), second_key);
+    }
+
+    #[test]
+    fn startup_refresh_skips_duplicates_without_rebuilding_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = temp_paths(dir.path());
+        let music = dir.path().join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        write_test_wav(&music.join("a.wav"));
+        write_test_wav(&music.join("b.wav"));
+        let list = dir.path().join("list.mp3list");
+        std::fs::write(&list, "#SEARCH#music\n").unwrap();
+
+        let mut core = AppCore::new(paths.clone(), None, false);
+        core.import_playlist(&list, false);
+        core.queue.set_shuffle(true);
+        // Every entry is already queued: the refresh must add nothing, but it
+        // still marks the restored cycle so later additions go to its end.
+        assert_eq!(core.refresh_startup_playlist(&list), 0);
+        assert_eq!(core.queue.len(), 2);
+        assert!(core.queue.shuffle_append);
+
+        // A playlist with no entries at all is a genuine empty result and must
+        // not touch the queue state.
+        let empty = dir.path().join("empty.mp3list");
+        std::fs::write(&empty, "").unwrap();
+        let mut core = AppCore::new(paths, None, false);
+        assert_eq!(core.refresh_startup_playlist(&empty), 0);
+        assert!(!core.queue.shuffle_append);
     }
 
     #[test]
@@ -7067,6 +7354,66 @@ mod settings_tests {
         assert_eq!(core.settings.theme.mode, defaults.theme.mode);
         assert_eq!(core.settings.theme.accent, defaults.theme.accent);
         assert_eq!(core.settings.theme.list_density, defaults.theme.list_density);
+    }
+
+    #[test]
+    fn play_after_stop_reopens_the_current_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = AppCore::new(temp_paths(dir.path()), None, false);
+        let file = dir.path().join("sample.mp3");
+        std::fs::write(&file, b"not audio").unwrap();
+        core.handle(Command::AddPaths(vec![file]));
+        core.handle(Command::PlayIndex(0));
+        core.handle(Command::Stop);
+        assert_eq!(core.playback_state, PlaybackState::Stopped);
+        // Stop unloads the decoder, so Play must reopen the track rather than
+        // call engine.play() on a closed deck (the button used to flip to
+        // "playing" and stay silent).
+        core.handle(Command::PlayPause);
+        assert!(
+            matches!(
+                core.playback_state,
+                PlaybackState::Loading | PlaybackState::Playing
+            ),
+            "{:?}",
+            core.playback_state
+        );
+        assert_eq!(core.queue.current, Some(0));
+    }
+
+    #[test]
+    fn web_control_starts_stops_and_generates_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = AppCore::new(temp_paths(dir.path()), None, false);
+        // Port 0 picks a free port so the test never collides with a real
+        // panel; the settings UI clamps to 1024.. and never stores it.
+        core.settings.web.port = 0;
+        assert!(!core.web_status().running);
+        core.handle(Command::SetWebEnabled(true));
+        let status = core.web_status();
+        assert!(status.running, "{status:?}");
+        assert!(status.error.is_none());
+        assert!(status.addr.is_some());
+        assert!(
+            !core.settings.web.access_key.is_empty(),
+            "enabling must generate a key"
+        );
+        let key = core.settings.web.access_key.clone();
+        core.handle(Command::SetWebReadOnly(true));
+        assert!(core.settings.web.read_only);
+        core.handle(Command::RegenerateWebAccessKey);
+        assert_ne!(core.settings.web.access_key, key);
+        core.handle(Command::SetWebEnabled(false));
+        assert!(!core.web_status().running);
+        // A persisted LAN bind without a key never starts (enabling through
+        // the UI generates one first, but a hand-edited settings file must
+        // still fail closed).
+        core.settings.web.enabled = true;
+        core.settings.web.bind_address = "0.0.0.0".to_string();
+        core.settings.web.access_key.clear();
+        core.start_web_control();
+        assert!(!core.web_status().running);
+        assert!(core.web_status().error.is_some());
     }
 }
 

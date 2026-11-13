@@ -1205,6 +1205,86 @@ impl Default for VisualizerSettings {
     }
 }
 
+/// Opt-in local web control panel (`core::web`).
+///
+/// The panel listens on a TCP port and exposes playback state plus transport
+/// control to a browser. It is off by default; a non-loopback bind also
+/// requires an access key so a misconfiguration cannot hand control of the
+/// player to the whole LAN.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebControlSettings {
+    pub enabled: bool,
+    /// Interface to listen on. `127.0.0.1` keeps the panel local;
+    /// `0.0.0.0` accepts LAN clients (an access key is mandatory then).
+    pub bind_address: String,
+    pub port: u16,
+    /// Access key. Empty means no authentication and is only accepted for a
+    /// loopback bind.
+    pub access_key: String,
+    /// Serve state only; reject every mutating command.
+    pub read_only: bool,
+}
+
+pub const DEFAULT_WEB_PORT: u16 = 42800;
+
+impl Default for WebControlSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port: DEFAULT_WEB_PORT,
+            access_key: String::new(),
+            read_only: false,
+        }
+    }
+}
+
+impl WebControlSettings {
+    /// Parsed bind address; `localhost`/empty map to IPv4 loopback.
+    pub fn bind_ip(&self) -> Option<std::net::IpAddr> {
+        let host = self.bind_address.trim();
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .ok()
+    }
+
+    pub fn loopback_only(&self) -> bool {
+        self.bind_ip().is_some_and(|ip| ip.is_loopback())
+    }
+
+    /// URL shown/copied by the settings page. A wildcard bind is browsed via
+    /// loopback; LAN clients use the machine's own address.
+    pub fn url(&self) -> String {
+        let mut host = self.bind_address.trim().to_string();
+        if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]" {
+            host = "127.0.0.1".to_string();
+        }
+        if host.contains(':') && !host.starts_with('[') {
+            host = format!("[{host}]");
+        }
+        format!("http://{host}:{}", self.port)
+    }
+
+    /// Why the panel cannot start with the current values, if anything.
+    pub fn startup_error(&self) -> Option<&'static str> {
+        if self.bind_ip().is_none() {
+            return Some("监听地址无效");
+        }
+        if !self.loopback_only() && self.access_key.trim().is_empty() {
+            return Some("局域网监听必须设置访问密钥");
+        }
+        if self.port != 0 && self.port < 1024 {
+            return Some("端口需大于 1023");
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShortcutSettings {
@@ -1215,6 +1295,11 @@ pub struct ShortcutSettings {
     pub volume_down: String,
     pub toggle_desktop_lyrics: String,
     pub show_hide: String,
+    /// Clipboard and text-fill helpers for the current track.
+    pub copy_lyric: String,
+    pub copy_title: String,
+    pub fill_lyric: String,
+    pub fill_title: String,
     pub enabled: bool,
     /// Map XInput button presses to playback commands.
     pub gamepad: bool,
@@ -1231,10 +1316,14 @@ pub enum ShortcutSlot {
     VolumeDown,
     ToggleDesktopLyrics,
     ShowHide,
+    CopyLyric,
+    CopyTitle,
+    FillLyric,
+    FillTitle,
 }
 
 impl ShortcutSlot {
-    pub const ALL: [ShortcutSlot; 7] = [
+    pub const ALL: [ShortcutSlot; 11] = [
         ShortcutSlot::PlayPause,
         ShortcutSlot::Next,
         ShortcutSlot::Prev,
@@ -1242,6 +1331,10 @@ impl ShortcutSlot {
         ShortcutSlot::VolumeDown,
         ShortcutSlot::ToggleDesktopLyrics,
         ShortcutSlot::ShowHide,
+        ShortcutSlot::CopyLyric,
+        ShortcutSlot::CopyTitle,
+        ShortcutSlot::FillLyric,
+        ShortcutSlot::FillTitle,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1253,6 +1346,10 @@ impl ShortcutSlot {
             ShortcutSlot::VolumeDown => "音量 -5%",
             ShortcutSlot::ToggleDesktopLyrics => "桌面歌词",
             ShortcutSlot::ShowHide => "显示 / 隐藏窗口",
+            ShortcutSlot::CopyLyric => "复制当前歌词",
+            ShortcutSlot::CopyTitle => "复制歌名",
+            ShortcutSlot::FillLyric => "填充歌词到鼠标窗口",
+            ShortcutSlot::FillTitle => "填充歌名到鼠标窗口",
         }
     }
 }
@@ -1267,6 +1364,10 @@ impl ShortcutSettings {
             ShortcutSlot::VolumeDown => &self.volume_down,
             ShortcutSlot::ToggleDesktopLyrics => &self.toggle_desktop_lyrics,
             ShortcutSlot::ShowHide => &self.show_hide,
+            ShortcutSlot::CopyLyric => &self.copy_lyric,
+            ShortcutSlot::CopyTitle => &self.copy_title,
+            ShortcutSlot::FillLyric => &self.fill_lyric,
+            ShortcutSlot::FillTitle => &self.fill_title,
         }
     }
 
@@ -1279,6 +1380,10 @@ impl ShortcutSettings {
             ShortcutSlot::VolumeDown => self.volume_down = value,
             ShortcutSlot::ToggleDesktopLyrics => self.toggle_desktop_lyrics = value,
             ShortcutSlot::ShowHide => self.show_hide = value,
+            ShortcutSlot::CopyLyric => self.copy_lyric = value,
+            ShortcutSlot::CopyTitle => self.copy_title = value,
+            ShortcutSlot::FillLyric => self.fill_lyric = value,
+            ShortcutSlot::FillTitle => self.fill_title = value,
         }
     }
 }
@@ -1293,6 +1398,12 @@ impl Default for ShortcutSettings {
             volume_down: "Ctrl+Alt+Down".to_string(),
             toggle_desktop_lyrics: "Ctrl+Alt+M".to_string(),
             show_hide: "Ctrl+Alt+Q".to_string(),
+            copy_lyric: "Ctrl+Alt+L".to_string(),
+            copy_title: "Ctrl+Alt+T".to_string(),
+            // Fill actions synthesize typing, so the defaults require Shift
+            // as well to make an accidental press less likely.
+            fill_lyric: "Ctrl+Alt+Shift+L".to_string(),
+            fill_title: "Ctrl+Alt+Shift+T".to_string(),
             enabled: true,
             gamepad: true,
         }
@@ -1423,6 +1534,8 @@ pub struct Settings {
     pub shortcuts: ShortcutSettings,
     pub radio: RadioSettings,
     pub mini: MiniPlayerSettings,
+    /// Opt-in browser control panel; disabled unless the user turns it on.
+    pub web: WebControlSettings,
 }
 
 impl Default for Settings {
@@ -1452,6 +1565,7 @@ impl Default for Settings {
             shortcuts: ShortcutSettings::default(),
             radio: RadioSettings::default(),
             mini: MiniPlayerSettings::default(),
+            web: WebControlSettings::default(),
         }
     }
 }
@@ -1518,6 +1632,17 @@ impl Settings {
         }
         if self.sources.is_empty() {
             self.sources = Settings::default().sources;
+        }
+        // Web control: repair values that could never bind or browse. A LAN
+        // bind without a key is left as-is; `core::web` refuses to start and
+        // the settings page shows why, which is clearer than rewriting the
+        // user's address behind their back.
+        self.web.bind_address = self.web.bind_address.trim().to_string();
+        if self.web.bind_ip().is_none() {
+            self.web.bind_address = WebControlSettings::default().bind_address;
+        }
+        if self.web.port < 1024 {
+            self.web.port = DEFAULT_WEB_PORT;
         }
     }
 
@@ -1799,15 +1924,11 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
 }
 
 fn write_json_atomic_with<T: Serialize>(path: &Path, value: &T, pretty: bool) -> io::Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = if pretty {
-        serde_json::to_vec_pretty(value)
-    } else {
-        serde_json::to_vec(value)
-    }
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     // Include the PID so two instances writing the same settings/session file
     // never contend for the same temporary name.
     let extension = path
@@ -1815,7 +1936,24 @@ fn write_json_atomic_with<T: Serialize>(path: &Path, value: &T, pretty: bool) ->
         .map(|extension| extension.to_string_lossy().into_owned())
         .unwrap_or_else(|| "json".to_string());
     let tmp = path.with_extension(format!("{extension}.{}.tmp", std::process::id()));
-    fs::write(&tmp, data)?;
+    // Stream the JSON into the temporary file instead of materializing it in
+    // a Vec: a 10k-track session is several megabytes, and the extra buffer
+    // only raises the peak of every autosave.
+    let write = || -> io::Result<()> {
+        let file = fs::File::create(&tmp)?;
+        let mut writer = io::BufWriter::with_capacity(64 * 1024, file);
+        let result = if pretty {
+            serde_json::to_writer_pretty(&mut writer, value)
+        } else {
+            serde_json::to_writer(&mut writer, value)
+        };
+        result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        writer.flush()
+    };
+    if let Err(err) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(_) => {

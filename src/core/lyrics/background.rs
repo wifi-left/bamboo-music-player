@@ -75,23 +75,12 @@ fn decode(path: &std::path::Path) -> LyricsBackgroundResult {
         image: None,
         error: None,
     };
-    let image = match image::open(path) {
-        Ok(image) => image,
-        Err(err) => {
-            result.error = Some(crate::trf!("无法读取背景图片: {}", err));
-            return result;
-        }
-    };
-    let image = if image.width() > MAX_SIDE || image.height() > MAX_SIDE {
-        image.thumbnail(MAX_SIDE, MAX_SIDE)
-    } else {
-        image
-    };
-    let rgba = image.to_rgba8();
-    result.image = Some(RgbaImage::from_rgba_unmultiplied(
-        [rgba.width() as usize, rgba.height() as usize],
-        &rgba.into_raw(),
-    ));
+    // Scale during decode (WIC) so a large photo never becomes a
+    // full-resolution RGBA frame just to be thumbnailed to MAX_SIDE.
+    match crate::util::image_util::decode_file_fit(path, MAX_SIDE) {
+        Ok(image) => result.image = Some(image),
+        Err(err) => result.error = Some(crate::trf!("无法读取背景图片: {}", err)),
+    }
     result
 }
 

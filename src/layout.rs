@@ -190,9 +190,9 @@ pub struct Layout {
 /// Rectangles for the Settings page. Computed from the same layout so
 /// painting and hit-testing cannot drift apart.
 pub struct SettingsLayout {
-    /// 曲库 / 播放 / 歌词 / 独立 / 桌面 / 迷你 / 窗口 / 外观 / 性能 / 系统 / 网络 / 存储 /
-    /// 快捷键 / 调试.
-    pub tabs: [Rect; 14],
+    /// 曲库 / 播放 / 歌词 / 独立 / 桌面 / 迷你 / 窗口 / 外观 / 性能 / 系统 / 网络 /
+    /// 网页控制 / 存储 / 快捷键 / 调试.
+    pub tabs: [Rect; 15],
     /// Y position of the first content row (below the tabs).
     pub top: f32,
     pub scan_toggle: Rect,
@@ -225,21 +225,19 @@ pub fn settings(layout: &Layout) -> SettingsLayout {
     let tab_height = 28.0;
     let row_gap = 4.0;
     let tabs_top = layout.header.bottom + 8.0;
-    let mut tabs = [Rect::default(); 14];
+    let mut tabs = [Rect::default(); 15];
     // Flow layout: fill the width from the left and wrap when the next tab no
-    // longer fits. Prefer a column count that divides the tab count evenly and
-    // keeps the tabs to at most two rows (14 → 7×2 on wide windows); when the
-    // window is too narrow for that, fall back to the maximum number of
-    // columns that fits so the control area keeps its height.
+    // longer fits. Keep at most two rows (15 → 8+7 on wide windows) and use
+    // the narrowest column count that fits, so a wide window does not leave a
+    // nearly empty second row. When even three rows do not fit, fall back to
+    // the maximum number of columns the width allows.
     let available = (right - left).max(1.0);
     let min_tab = 96.0;
     let max_columns = (((available + tab_gap) / (min_tab + tab_gap)).floor() as usize)
         .clamp(1, tabs.len());
-    let columns = (2..=max_columns)
-        .rev()
-        .find(|count| {
-            tabs.len() % count == 0 && tabs.len().div_ceil(*count) <= 2
-        })
+    let columns = (1..=3)
+        .map(|rows| tabs.len().div_ceil(rows))
+        .find(|columns| *columns <= max_columns)
         .unwrap_or(max_columns);
     let tab_width =
         ((available - tab_gap * (columns.saturating_sub(1)) as f32) / columns as f32).max(1.0);
@@ -1169,13 +1167,14 @@ mod tests {
         let layout = compute_with(1200.0, 800.0, false, false);
         let settings = settings(&layout);
         let right = layout.content.right - 32.0;
-        // 14 tabs prefer a divisor that yields two rows, so wide windows use
-        // 7×2 and the first row ends exactly at the right edge.
-        assert!((settings.tabs[6].right - right).abs() < 0.5);
+        // 15 tabs need two rows; 8 columns is the narrowest that fits, so the
+        // first row is 8 tabs and the second row is 7.
+        assert!((settings.tabs[7].right - right).abs() < 0.5);
         assert!(settings.tabs[0].width() > 90.0);
-        assert!(settings.tabs[7].top > settings.tabs[6].top);
-        assert!(settings.tabs[7].left <= settings.tabs[0].left + 0.5);
-        assert!((settings.tabs[13].right - right).abs() < 0.5);
+        assert!(settings.tabs[8].top > settings.tabs[7].top);
+        assert!(settings.tabs[8].left <= settings.tabs[0].left + 0.5);
+        assert!(settings.tabs[14].right < right);
+        assert!(settings.tabs[14].right > settings.tabs[8].right);
     }
 
     #[test]

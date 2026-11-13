@@ -22,3 +22,4 @@ pub mod platform;
 pub mod playlist;
 pub mod radio;
 pub mod util;
+pub mod web;

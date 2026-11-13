@@ -4,10 +4,12 @@
 //! produces CPU-side RGBA images that the UI layer uploads.
 
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use windows::core::Interface;
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapSource, IWICImagingFactory,
     WICBitmapInterpolationModeFant, IWICPalette, WICBitmapDitherTypeNone,
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand, WICRect,
 };
@@ -18,13 +20,15 @@ use windows::Win32::System::Com::{
 /// Fallback artwork shown when a track has no cover or cover loading is off.
 pub const DEFAULT_COVER_PNG: &[u8] = include_bytes!("../../../assets/default_cd.png");
 
-/// Decode with WIC, center-cropping to a square and scaling during decode.
+/// Decode with WIC, scaling during decode.
 ///
 /// Large embedded covers (4000-6000 px JPEGs) spend most of their time in the
 /// decoder; WIC's native codec plus its scaler path is considerably faster
-/// than decoding the full image and resizing it in Rust. Returns `None` for
-/// formats/codecs WIC cannot handle, so callers can fall back to `image`.
-fn decode_wic_square(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
+/// than decoding the full image and resizing it in Rust. With `square` the
+/// image is center-cropped to a square, otherwise its aspect ratio is kept and
+/// it is scaled to fit `max_side`. Returns `None` for formats/codecs WIC
+/// cannot handle, so callers can fall back to `image`.
+fn decode_wic(bytes: &[u8], max_side: u32, square: bool) -> Option<RgbaImage> {
     if max_side == 0 || bytes.is_empty() {
         return None;
     }
@@ -45,24 +49,52 @@ fn decode_wic_square(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
         if width == 0 || height == 0 {
             return None;
         }
-        let side = width.min(height);
-        let crop = WICRect {
-            X: ((width - side) / 2) as i32,
-            Y: ((height - side) / 2) as i32,
-            Width: side as i32,
-            Height: side as i32,
+        let clipper = if square {
+            let side = width.min(height);
+            let crop = WICRect {
+                X: ((width - side) / 2) as i32,
+                Y: ((height - side) / 2) as i32,
+                Width: side as i32,
+                Height: side as i32,
+            };
+            let clipper = factory.CreateBitmapClipper().ok()?;
+            clipper.Initialize(&frame, &crop).ok()?;
+            Some(clipper)
+        } else {
+            None
         };
-        let clipper = factory.CreateBitmapClipper().ok()?;
-        clipper.Initialize(&frame, &crop).ok()?;
-        let target = side.min(max_side).max(1);
-        let scaler = factory.CreateBitmapScaler().ok()?;
-        scaler
-            .Initialize(&clipper, target, target, WICBitmapInterpolationModeFant)
-            .ok()?;
+        let (source_w, source_h) = if square {
+            let side = width.min(height);
+            (side, side)
+        } else {
+            (width, height)
+        };
+        // Keep the aspect ratio and never upscale: the caller stores the
+        // result and the painter stretches it to the target rectangle.
+        let scale = (max_side as f64 / f64::from(source_w.max(source_h))).min(1.0);
+        let target_w = ((f64::from(source_w) * scale).round() as u32).max(1);
+        let target_h = ((f64::from(source_h) * scale).round() as u32).max(1);
+
+        let mut source: IWICBitmapSource = match &clipper {
+            Some(clipper) => clipper.cast().ok()?,
+            None => frame.cast().ok()?,
+        };
+        if target_w != source_w || target_h != source_h {
+            let scaler = factory.CreateBitmapScaler().ok()?;
+            scaler
+                .Initialize(
+                    &source,
+                    target_w,
+                    target_h,
+                    WICBitmapInterpolationModeFant,
+                )
+                .ok()?;
+            source = scaler.cast().ok()?;
+        }
         let converter = factory.CreateFormatConverter().ok()?;
         converter
             .Initialize(
-                &scaler,
+                &source,
                 &GUID_WICPixelFormat32bppRGBA,
                 WICBitmapDitherTypeNone,
                 None::<&IWICPalette>,
@@ -70,13 +102,13 @@ fn decode_wic_square(bytes: &[u8], max_side: u32) -> Option<RgbaImage> {
                 WICBitmapPaletteTypeCustom,
             )
             .ok()?;
-        let stride = target * 4;
-        let mut pixels = vec![0u8; (stride * target) as usize];
+        let stride = target_w * 4;
+        let mut pixels = vec![0u8; (stride * target_h) as usize];
         converter
             .CopyPixels(std::ptr::null(), stride, &mut pixels)
             .ok()?;
         Some(RgbaImage {
-            size: [target as usize, target as usize],
+            size: [target_w as usize, target_h as usize],
             pixels,
             id: next_image_id(),
         })
@@ -140,6 +172,32 @@ fn decode_limited(bytes: &[u8]) -> Option<image::DynamicImage> {
     reader.decode().ok()
 }
 
+/// Decode an image file scaled to fit `max_side`, preserving its aspect ratio.
+///
+/// Used for user-selected wallpapers and lyrics backgrounds: WIC scales while
+/// decoding, so a 24-megapixel photo never expands into a full-resolution
+/// RGBA frame (tens of megabytes) just to be thumbnailed afterwards. Falls
+/// back to the `image` crate, with allocation limits, for formats WIC cannot
+/// read.
+pub fn decode_file_fit(path: &Path, max_side: u32) -> Result<RgbaImage, String> {
+    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    if let Some(image) = decode_wic(&bytes, max_side, false) {
+        return Ok(image);
+    }
+    let image = decode_limited(&bytes)
+        .ok_or_else(|| crate::i18n::tr("无法解码图片").to_string())?;
+    let image = if image.width() > max_side || image.height() > max_side {
+        image.thumbnail(max_side, max_side)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    Ok(RgbaImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
+}
+
 /// UI-independent RGBA8 image (top-left origin, unmultiplied alpha).
 ///
 /// The UI layer uploads this to whatever surface it uses (Direct2D bitmap,
@@ -191,7 +249,7 @@ pub fn decode_cover_images(
     // Fast path: native WIC decode + center crop + scale. Large JPEG album
     // art is the common slow case and this avoids materializing the original
     // 20-30 MB RGBA frame before thumbnailing it.
-    if let Some(cover) = decode_wic_square(bytes, max_side) {
+    if let Some(cover) = decode_wic(bytes, max_side, true) {
         let (background, source) =
             derivative_images(&cover, accent, want_background, blur_strength);
         return Some(DecodedCover {
@@ -319,7 +377,7 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
             .unwrap();
         let start = std::time::Instant::now();
-        let wic = decode_wic_square(&bytes, 640).unwrap();
+        let wic = decode_wic(&bytes, 640, true).unwrap();
         let wic_time = start.elapsed();
         let start = std::time::Instant::now();
         let img = decode_limited(&bytes).unwrap().thumbnail(640, 640);

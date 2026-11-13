@@ -154,6 +154,10 @@ pub enum SettingsAction {
     Export,
     Import,
     Reset,
+    /// Open the web control panel in the default browser.
+    OpenWebPanel,
+    /// Copy the panel URL to the clipboard.
+    CopyWebUrl,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,13 +173,14 @@ pub enum SettingsTab {
     Performance,
     System,
     Network,
+    Web,
     Storage,
     Shortcuts,
     Debug,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 14] = [
+    pub const ALL: [SettingsTab; 15] = [
         SettingsTab::Library,
         SettingsTab::Playback,
         SettingsTab::Lyrics,
@@ -187,6 +192,7 @@ impl SettingsTab {
         SettingsTab::Performance,
         SettingsTab::System,
         SettingsTab::Network,
+        SettingsTab::Web,
         SettingsTab::Storage,
         SettingsTab::Shortcuts,
         SettingsTab::Debug,
@@ -205,6 +211,7 @@ impl SettingsTab {
             SettingsTab::Performance => "性能",
             SettingsTab::System => "系统",
             SettingsTab::Network => "网络",
+            SettingsTab::Web => "网页控制",
             SettingsTab::Storage => "存储",
             SettingsTab::Shortcuts => "快捷键",
             SettingsTab::Debug => "调试",
@@ -224,6 +231,7 @@ impl SettingsTab {
             SettingsTab::Performance => &PERFORMANCE_FIELDS,
             SettingsTab::System => &SYSTEM_FIELDS,
             SettingsTab::Network => &NETWORK_FIELDS,
+            SettingsTab::Web => &WEB_FIELDS,
             SettingsTab::Storage => &STORAGE_FIELDS,
             SettingsTab::Shortcuts => &SHORTCUTS_FIELDS,
             SettingsTab::Debug => &DEBUG_FIELDS,
@@ -457,6 +465,19 @@ pub enum SettingField {
     StreamCacheDir,
     ClearCache,
     OnlineTest,
+    /// Local web control panel.
+    WebEnabled,
+    WebBind,
+    WebPort,
+    WebAccessKey,
+    WebRegenerateKey,
+    WebReadOnly,
+    /// Run state + bound address (read-only).
+    WebStatus,
+    /// Static explanation for the bind/address rows.
+    WebHint,
+    WebOpen,
+    WebCopyUrl,
     /// Download settings and manager.
     DownloadDir,
     DownloadConcurrency,
@@ -545,7 +566,7 @@ const SYSTEM_FIELDS: [SettingField; 10] = [
     SettingField::ResetSettings,
 ];
 
-const SHORTCUTS_FIELDS: [SettingField; 10] = [
+const SHORTCUTS_FIELDS: [SettingField; 14] = [
     SettingField::ShortcutsEnabled,
     SettingField::GamepadEnabled,
     SettingField::Shortcut(ShortcutSlot::PlayPause),
@@ -555,6 +576,10 @@ const SHORTCUTS_FIELDS: [SettingField; 10] = [
     SettingField::Shortcut(ShortcutSlot::VolumeDown),
     SettingField::Shortcut(ShortcutSlot::ToggleDesktopLyrics),
     SettingField::Shortcut(ShortcutSlot::ShowHide),
+    SettingField::Shortcut(ShortcutSlot::CopyLyric),
+    SettingField::Shortcut(ShortcutSlot::CopyTitle),
+    SettingField::Shortcut(ShortcutSlot::FillLyric),
+    SettingField::Shortcut(ShortcutSlot::FillTitle),
     SettingField::ResetShortcuts,
 ];
 
@@ -579,6 +604,19 @@ const NETWORK_FIELDS: [SettingField; 20] = [
     SettingField::CacheLimitMb,
     SettingField::StreamCacheDir,
     SettingField::ClearCache,
+];
+
+const WEB_FIELDS: [SettingField; 10] = [
+    SettingField::WebEnabled,
+    SettingField::WebStatus,
+    SettingField::WebBind,
+    SettingField::WebPort,
+    SettingField::WebAccessKey,
+    SettingField::WebRegenerateKey,
+    SettingField::WebReadOnly,
+    SettingField::WebHint,
+    SettingField::WebOpen,
+    SettingField::WebCopyUrl,
 ];
 
 const STORAGE_FIELDS: [SettingField; 10] = [
@@ -2424,6 +2462,85 @@ impl App {
                 label: "测试在线音源",
                 kind: SettingKind::Action,
                 value: "连接".to_string(),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebEnabled => toggle("启用网页控制", settings.web.enabled),
+            SettingField::WebStatus => {
+                let status = self.core.web_status();
+                SettingView {
+                    label: "运行状态",
+                    kind: SettingKind::Info,
+                    value: if status.running {
+                        format!("运行中 · {}", status.addr.unwrap_or_default())
+                    } else if let Some(error) = status.error {
+                        format!("未启动：{error}")
+                    } else {
+                        "已停止".to_string()
+                    },
+                    active: status.running,
+                    options: &[],
+                    selected: None,
+                }
+            }
+            SettingField::WebBind => SettingView {
+                label: "监听地址",
+                kind: SettingKind::Text,
+                value: settings.web.bind_address.clone(),
+                active: !settings.web.loopback_only(),
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebPort => SettingView {
+                label: "端口",
+                kind: SettingKind::Step,
+                value: settings.web.port.to_string(),
+                active: self.core.web_status().running,
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebAccessKey => SettingView {
+                label: "访问密钥",
+                kind: SettingKind::Text,
+                value: if settings.web.access_key.trim().is_empty() {
+                    "未设置（仅本机可免密钥）".to_string()
+                } else {
+                    settings.web.access_key.clone()
+                },
+                active: !settings.web.access_key.trim().is_empty(),
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebRegenerateKey => SettingView {
+                label: "重新生成密钥",
+                kind: SettingKind::Action,
+                value: "生成新的随机密钥".to_string(),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebReadOnly => toggle("只读模式", settings.web.read_only),
+            SettingField::WebHint => SettingView {
+                label: "说明",
+                kind: SettingKind::Info,
+                value: "0.0.0.0 = 局域网访问（必须设置密钥）".to_string(),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebOpen => SettingView {
+                label: "打开控制面板",
+                kind: SettingKind::Action,
+                value: settings.web.url(),
+                active: self.core.web_status().running,
+                options: &[],
+                selected: None,
+            },
+            SettingField::WebCopyUrl => SettingView {
+                label: "复制访问地址",
+                kind: SettingKind::Action,
+                value: "复制到剪贴板".to_string(),
                 active: false,
                 options: &[],
                 selected: None,
@@ -4438,6 +4555,27 @@ impl App {
                 !self.core.settings.download.add_to_library,
             ),
             SettingField::ClearFinishedDownloads => Command::ClearFinishedDownloads,
+            SettingField::WebEnabled => Command::SetWebEnabled(!self.core.settings.web.enabled),
+            SettingField::WebBind | SettingField::WebAccessKey => {
+                self.text_edit_request = Some(index);
+                return;
+            }
+            SettingField::WebPort => Command::SetWebPort(
+                (self.core.settings.web.port as i64 + delta as i64).clamp(1024, 65535) as u16,
+            ),
+            SettingField::WebRegenerateKey => Command::RegenerateWebAccessKey,
+            SettingField::WebReadOnly => {
+                Command::SetWebReadOnly(!self.core.settings.web.read_only)
+            }
+            SettingField::WebOpen => {
+                self.settings_action = Some(SettingsAction::OpenWebPanel);
+                return;
+            }
+            SettingField::WebCopyUrl => {
+                self.settings_action = Some(SettingsAction::CopyWebUrl);
+                return;
+            }
+            SettingField::WebStatus | SettingField::WebHint => return,
             // Debug rows are either read-only Info values or the release
             // action handled before this match.
             SettingField::DebugWorkingSet
@@ -5223,6 +5361,23 @@ impl App {
         let position_ms = (snapshot.position_secs * 1000.0).max(0.0) as i64
             + self.core.settings.lyrics.offset_ms;
         lyrics.index_at(position_ms.max(0) as u64)
+    }
+
+    /// Text of the line currently highlighted in the lyric panel. Untimed
+    /// lyrics have no active line, so the copy/fill hotkeys do nothing there.
+    pub fn current_lyric_text(&self) -> Option<String> {
+        let snapshot = self.core.snapshot();
+        let lyrics = snapshot.lyrics?;
+        let index = self.active_lyric_line()?;
+        let text = lyrics.lines.get(index)?.text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// Display title of the current track (filename/URL fallback included).
+    pub fn current_title_text(&self) -> Option<String> {
+        let title = self.core.snapshot().current?.display_title();
+        let title = title.trim();
+        (!title.is_empty()).then(|| title.to_string())
     }
 
     pub fn invalidate(&mut self, hwnd: HWND, area: Rect) {
@@ -7544,6 +7699,7 @@ impl App {
             SettingField::NetworkRetries => settings.network.retries as f32,
             SettingField::CacheLimitMb => settings.network.cache_limit_mb as f32,
             SettingField::DownloadConcurrency => settings.download.concurrency as f32,
+            SettingField::WebPort => settings.web.port as f32,
             _ => return None,
         };
         let percent = matches!(
@@ -7648,6 +7804,8 @@ impl App {
             SettingField::SourceBaseUrl => Command::SetSourceBaseUrl(text),
             SettingField::ProxyUrl => Command::SetNetworkProxyUrl(text),
             SettingField::DownloadTemplate => Command::SetDownloadTemplate(text),
+            SettingField::WebBind => Command::SetWebBindAddress(text),
+            SettingField::WebAccessKey => Command::SetWebAccessKey(text),
             _ => {
                 self.invalidate_all(hwnd);
                 return;
@@ -7718,6 +7876,7 @@ impl App {
                 | SettingField::IdleFrameRate
                 | SettingField::ThumbnailCache
                 | SettingField::TrimIdleSecs
+                | SettingField::WebPort
                 | SettingField::LyricsOffset
                 | SettingField::LyricsOutlineWidth
                 | SettingField::LyricsShadowOffset
@@ -7875,6 +8034,9 @@ impl App {
             }
             SettingField::DownloadConcurrency => {
                 Command::SetDownloadConcurrency(value.round().clamp(1.0, 4.0) as u8)
+            }
+            SettingField::WebPort => {
+                Command::SetWebPort(value.round().clamp(1024.0, 65535.0) as u16)
             }
             _ => return,
         };

@@ -205,6 +205,10 @@ mod tests {
         assert_eq!(settings.next, "Ctrl+Alt+Right");
         assert_eq!(settings.toggle_desktop_lyrics, "Ctrl+Alt+M");
         assert_eq!(settings.show_hide, "Ctrl+Alt+Q");
+        assert_eq!(settings.copy_lyric, "Ctrl+Alt+L");
+        assert_eq!(settings.copy_title, "Ctrl+Alt+T");
+        assert_eq!(settings.fill_lyric, "Ctrl+Alt+Shift+L");
+        assert_eq!(settings.fill_title, "Ctrl+Alt+Shift+T");
         assert!(settings.gamepad);
     }
 

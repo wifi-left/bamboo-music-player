@@ -16,6 +16,7 @@ pub mod overlay_inbox;
 pub mod registry;
 pub mod single_instance;
 pub mod smtc;
+pub mod text_inject;
 pub mod timer_resolution;
 pub mod tray;
 

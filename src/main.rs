@@ -31,7 +31,7 @@ mod ui;
 // `crate::config`, ... paths; re-exporting them here keeps the move mechanical.
 pub use self::core::{
     api, audio, config, desktop_overlay, download, i18n, library, lyrics, mini_overlay, model,
-    overlay_protocol, platform, playlist, radio, util,
+    overlay_protocol, platform, playlist, radio, util, web,
 };
 
 use std::ffi::OsString;
@@ -156,7 +156,8 @@ use crate::paint::Painter;
 
 /// Global hotkey ids. The order matches `ShortcutSlot::ALL`.
 const HOTKEY_BASE: usize = 0x7100;
-const SHORTCUT_COUNT: usize = 7;
+const SHORTCUT_COUNT: usize = 11;
+const _: () = assert!(SHORTCUT_COUNT == crate::config::ShortcutSlot::ALL.len());
 
 const ANIM_TIMER: usize = 1;
 const QUIT_TIMER: usize = 2;
@@ -489,8 +490,8 @@ fn mini_settings_key(app: &App) -> MiniSettingsKey {
     }
 }
 
-/// Enabled flag plus the seven combinations currently registered. Order
-/// matches `ShortcutSlot::ALL`.
+/// Enabled flag plus the combinations currently registered. Order matches
+/// `ShortcutSlot::ALL`.
 #[derive(Clone, PartialEq, Eq)]
 struct ShortcutsApplied {
     enabled: bool,
@@ -831,6 +832,11 @@ fn run() -> windows::core::Result<u8> {
             Some(wake.clone()),
             load_library,
         );
+        // The web panel is opt-in and disabled by default; bench/self-test
+        // runs must never open a listening socket.
+        if load_library {
+            model.core.start_web_control();
+        }
         // Accessibility zoom multiplies the effective DPI: layout, fonts,
         // native controls and mouse coordinates all use it like a real DPI.
         model.set_metrics(
@@ -2298,6 +2304,39 @@ fn perform_settings_action(hwnd: HWND, action: crate::app::SettingsAction) {
                 }
             }
         }
+        Action::OpenWebPanel => {
+            let url = unsafe { state_mut(hwnd) }
+                .as_ref()
+                .map(|state| state.app.core.settings.web.url());
+            let Some(url) = url else {
+                return;
+            };
+            // The address is user-editable; refuse anything that is not a
+            // plain http URL so a mistyped scheme cannot launch another app.
+            if !url.starts_with("http://") {
+                return;
+            }
+            if let Err(err) = webbrowser::open(&url) {
+                if let Some(state) = unsafe { state_mut(hwnd) } {
+                    state
+                        .app
+                        .push_toast(hwnd, crate::trf!("无法打开浏览器：{}", err), true);
+                }
+            }
+        }
+        Action::CopyWebUrl => {
+            let url = unsafe { state_mut(hwnd) }
+                .as_ref()
+                .map(|state| state.app.core.settings.web.url());
+            if let Some(url) = url {
+                copy_to_clipboard(&url);
+                if let Some(state) = unsafe { state_mut(hwnd) } {
+                    state
+                        .app
+                        .push_toast(hwnd, crate::i18n::tr("访问地址已复制"), false);
+                }
+            }
+        }
     }
 }
 
@@ -3245,17 +3284,23 @@ unsafe fn sync_timer(hwnd: HWND) {
     // The debug tab shows live memory/handle/GPU values; a 2 s heartbeat keeps
     // them current even when playback is paused and nothing else animates.
     let debug_live = visible && state.app.debug_tab_active();
+    // An open web control panel polls at 1 Hz; publish a fresh snapshot four
+    // times a second so its progress bar and lyrics stay smooth. `web_active`
+    // goes false 30 s after the last request, so a forgotten panel costs no
+    // periodic ticks once its browser is gone.
+    let web_live = state.app.core.web_active();
     let animate = state.bench.is_some()
         || toast
         || visible_anim
         || overlay_heartbeat
         || system_heartbeat
-        || debug_live;
+        || debug_live
+        || web_live;
     if animate {
         let frame = state.app.core.settings.performance.frame_millis() as u32;
         let interval = if state.bench.is_some() || visible_anim {
             frame
-        } else if overlay_heartbeat {
+        } else if overlay_heartbeat || web_live {
             // The overlay needs a new position message every 250 ms; its own
             // render timer smooths the motion in between.
             250
@@ -4732,8 +4777,23 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-fn open_file_location(path: &std::path::Path) {
-    let params = format!("/select,\"{}\"", path.display());
+/// Fill hotkeys run off the UI thread: bringing the hovered window forward and
+/// feeding Unicode through `SendInput` can take a couple of frames, and the
+/// player must keep painting. The raw handle is sent as `isize` because `HWND`
+/// is not `Send`.
+fn spawn_text_fill(text: String, own_window: HWND) {
+    let own = own_window.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("bamboo-text-fill".to_string())
+        .spawn(move || {
+            let own = HWND(own as *mut std::ffi::c_void);
+            if !crate::platform::text_inject::type_under_cursor(&text, own) {
+                tracing::warn!("text fill skipped: no writable window under the cursor");
+            }
+        });
+}
+
+fn open_file_location(path: &std::path::Path) {    let params = format!("/select,\"{}\"", path.display());
     let wide: Vec<u16> = params.encode_utf16().chain([0]).collect();
     unsafe {
         let _ = ShellExecuteW(
@@ -5702,6 +5762,26 @@ unsafe extern "system" fn window_proc(
                                     let _ = SetForegroundWindow(hwnd);
                                 }
                                 restore_window(state, hwnd);
+                            }
+                        }
+                        7 => {
+                            if let Some(text) = state.app.current_lyric_text() {
+                                copy_to_clipboard(&text);
+                            }
+                        }
+                        8 => {
+                            if let Some(text) = state.app.current_title_text() {
+                                copy_to_clipboard(&text);
+                            }
+                        }
+                        9 => {
+                            if let Some(text) = state.app.current_lyric_text() {
+                                spawn_text_fill(text, hwnd);
+                            }
+                        }
+                        10 => {
+                            if let Some(text) = state.app.current_title_text() {
+                                spawn_text_fill(text, hwnd);
                             }
                         }
                         _ => {}

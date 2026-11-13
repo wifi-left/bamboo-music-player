@@ -8,7 +8,7 @@
 //! `BeginPaint` clips GDI to the update region, and the app hands over the
 //! exact dirty rectangles so untouched elements are skipped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rayon::prelude::*;
 
@@ -64,9 +64,15 @@ pub struct Painter {
     font_family: Option<String>,
     font_scale: f32,
     /// Converted BGRA pixels for decoded covers, keyed by the image's unique
-    /// id. A cover is decoded once and reused for every paint until the cache
-    /// is trimmed, which keeps per-row thumbnails off the conversion path.
+    /// id. A cover is decoded once and reused for every paint until it ages
+    /// out of the byte budget, which keeps per-row thumbnails off the
+    /// conversion path without letting a long listening session pin hundreds
+    /// of megabytes of full-size covers.
     images: HashMap<u64, CoverPixels>,
+    /// Insertion order for `images`, oldest first.
+    image_order: VecDeque<u64>,
+    /// Total bytes held by `images` (the BGRA buffers only).
+    image_bytes: usize,
     /// Persistent double buffer: all GDI drawing goes here and only the dirty
     /// bounding box is blitted to the window, so partial repaints never show a
     /// half-drawn frame.
@@ -96,6 +102,11 @@ struct CoverPixels {
     height: i32,
 }
 
+/// Upper bound for converted cover pixels. Row thumbnails are ~16 KB each and
+/// a full-size cover ~1.6 MB, so this comfortably holds the visible list plus
+/// the current artwork without letting successive tracks accumulate forever.
+const IMAGE_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+
 impl Painter {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -105,6 +116,8 @@ impl Painter {
             font_family: None,
             font_scale: 1.0,
             images: HashMap::new(),
+            image_order: VecDeque::new(),
+            image_bytes: 0,
             back_dc: None,
             back_bitmap: None,
             back_old: None,
@@ -3658,11 +3671,14 @@ impl Painter {
     /// the settings debug page's manual "release memory" action.
     pub fn clear_image_cache(&mut self) {
         self.images.clear();
+        self.image_order.clear();
+        self.image_bytes = 0;
         self.background = None;
         self.background_key = (0, true, [0, 0, 0], 0, 0, 0);
     }
 
-    fn cached_cover(&mut self, image: &RgbaImage) -> Option<&CoverPixels> {        let key = image.id;
+    fn cached_cover(&mut self, image: &RgbaImage) -> Option<&CoverPixels> {
+        let key = image.id;
         if !self.images.contains_key(&key) {
             let (w, h) = (image.size[0] as i32, image.size[1] as i32);
             if w <= 0 || h <= 0 || image.pixels.len() < (w * h * 4) as usize {
@@ -3675,9 +3691,7 @@ impl Painter {
                 dst[2] = px[0];
                 dst[3] = px[3];
             }
-            if self.images.len() >= 384 {
-                self.images.clear();
-            }
+            let bytes = bgra.len();
             self.images.insert(
                 key,
                 CoverPixels {
@@ -3686,6 +3700,19 @@ impl Painter {
                     height: h,
                 },
             );
+            self.image_order.push_back(key);
+            self.image_bytes = self.image_bytes.saturating_add(bytes);
+            // Evict the oldest entries once the byte budget is exceeded. The
+            // most recent entry is never evicted, so a single image larger
+            // than the whole budget still paints (it was just inserted).
+            while self.image_bytes > IMAGE_CACHE_BUDGET && self.images.len() > 1 {
+                let Some(old) = self.image_order.pop_front() else {
+                    break;
+                };
+                if let Some(entry) = self.images.remove(&old) {
+                    self.image_bytes = self.image_bytes.saturating_sub(entry.bgra.len());
+                }
+            }
         }
         self.images.get(&key)
     }
@@ -4127,4 +4154,37 @@ pub fn edit_text_color(pal: &Palette) -> COLORREF {
 /// search field, so the unused strip at the bottom is invisible).
 pub fn list_background(pal: &Palette) -> COLORREF {
     pal.player
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_cache_stays_within_its_byte_budget() {
+        let mut painter = Painter::new().expect("painter");
+        let pixels = vec![0u8; 1024 * 512 * 4];
+        let mut last_id = 0;
+        // 2 MB per image: the cache must start evicting long before 20 of
+        // them, or a long listening session pins hundreds of megabytes.
+        for _ in 0..20 {
+            let image = RgbaImage::from_rgba_unmultiplied([1024, 512], &pixels);
+            last_id = image.id;
+            assert!(painter.cached_cover(&image).is_some());
+        }
+        assert!(painter.image_bytes <= IMAGE_CACHE_BUDGET);
+        assert!(painter.images.len() < 20);
+        // The newest image is what the current frame is drawing.
+        assert!(painter.images.contains_key(&last_id));
+    }
+
+    #[test]
+    fn single_oversized_image_is_still_cached() {
+        let mut painter = Painter::new().expect("painter");
+        // 4096x1280 = 20 MB, larger than the whole budget.
+        let pixels = vec![0u8; 4096 * 1280 * 4];
+        let image = RgbaImage::from_rgba_unmultiplied([4096, 1280], &pixels);
+        assert!(painter.cached_cover(&image).is_some());
+        assert_eq!(painter.images.len(), 1);
+    }
 }

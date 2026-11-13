@@ -10,7 +10,7 @@
 //! and the dirty-rect bookkeeping.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
@@ -171,10 +171,11 @@ pub enum SettingsTab {
     Network,
     Storage,
     Shortcuts,
+    Debug,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 13] = [
+    pub const ALL: [SettingsTab; 14] = [
         SettingsTab::Library,
         SettingsTab::Playback,
         SettingsTab::Lyrics,
@@ -188,6 +189,7 @@ impl SettingsTab {
         SettingsTab::Network,
         SettingsTab::Storage,
         SettingsTab::Shortcuts,
+        SettingsTab::Debug,
     ];
 
     pub fn label(self) -> &'static str {
@@ -205,6 +207,7 @@ impl SettingsTab {
             SettingsTab::Network => "网络",
             SettingsTab::Storage => "存储",
             SettingsTab::Shortcuts => "快捷键",
+            SettingsTab::Debug => "调试",
         }
     }
 
@@ -223,6 +226,7 @@ impl SettingsTab {
             SettingsTab::Network => &NETWORK_FIELDS,
             SettingsTab::Storage => &STORAGE_FIELDS,
             SettingsTab::Shortcuts => &SHORTCUTS_FIELDS,
+            SettingsTab::Debug => &DEBUG_FIELDS,
         }
     }
 }
@@ -464,7 +468,29 @@ pub enum SettingField {
     DownloadSaveLyrics,
     DownloadAddToLibrary,
     ClearFinishedDownloads,
+    /// Read-only diagnostics on the Debug tab (refreshed while visible).
+    DebugWorkingSet,
+    DebugPrivateMemory,
+    DebugPeakMemory,
+    DebugSystemMemory,
+    DebugGpu,
+    DebugRenderer,
+    DebugHandles,
+    DebugCaches,
+    DebugReleaseMemory,
 }
+
+const DEBUG_FIELDS: [SettingField; 9] = [
+    SettingField::DebugWorkingSet,
+    SettingField::DebugPrivateMemory,
+    SettingField::DebugPeakMemory,
+    SettingField::DebugSystemMemory,
+    SettingField::DebugGpu,
+    SettingField::DebugRenderer,
+    SettingField::DebugHandles,
+    SettingField::DebugCaches,
+    SettingField::DebugReleaseMemory,
+];
 
 const PLAYBACK_FIELDS: [SettingField; 24] = [
     SettingField::Gapless,
@@ -843,6 +869,8 @@ pub enum SettingKind {
     Action,
     /// Inline native text editor over the value area.
     Text,
+    /// Read-only live value (debug page); no click target.
+    Info,
 }
 
 #[derive(Clone)]
@@ -992,6 +1020,10 @@ pub struct App {    pub dpi: f32,
     pub player_panel_open: bool,
     /// Set when the flyout closes so the shell repaints the lyric child under it.
     player_panel_closed: bool,
+    /// Set by the debug tab's release action; the shell clears its BGRA caches.
+    painter_cache_clear_requested: bool,
+    /// Last time the debug tab refreshed its live values.
+    last_debug_refresh: Option<Instant>,
     pub ui: Interaction,
     /// Whether the native sort LISTBOX is shown (owned by the shell).
     pub sort_menu_open: bool,
@@ -1131,6 +1163,8 @@ impl App {
             big_lyrics: false,
             player_panel_open: false,
             player_panel_closed: false,
+            painter_cache_clear_requested: false,
+            last_debug_refresh: None,
             ui: Interaction::default(),
             sort_menu_open: false,
             toast: None,
@@ -1733,7 +1767,8 @@ impl App {
             return None;
         }
         match self.ui.hover_target()? {
-            Target::SettingsToggleRow(index)
+            Target::SettingsRow(index)
+            | Target::SettingsToggleRow(index)
             | Target::SettingsChoice(index, _)
             | Target::SettingsChoiceCycle(index)
             | Target::SettingsStep(index, _)
@@ -2472,6 +2507,126 @@ impl App {
                         .count()
                 ),
                 active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugWorkingSet => SettingView {
+                label: "工作集",
+                kind: SettingKind::Info,
+                value: crate::platform::memory::process_memory()
+                    .map(|memory| crate::platform::memory::format_mb(memory.working_set))
+                    .unwrap_or_else(|| "--".to_string()),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugPrivateMemory => SettingView {
+                label: "私有内存",
+                kind: SettingKind::Info,
+                value: crate::platform::memory::process_memory()
+                    .map(|memory| crate::platform::memory::format_mb(memory.private_usage))
+                    .unwrap_or_else(|| "--".to_string()),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugPeakMemory => SettingView {
+                label: "峰值工作集",
+                kind: SettingKind::Info,
+                value: crate::platform::memory::process_memory()
+                    .map(|memory| crate::platform::memory::format_mb(memory.peak_working_set))
+                    .unwrap_or_else(|| "--".to_string()),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugSystemMemory => SettingView {
+                label: "系统内存",
+                kind: SettingKind::Info,
+                value: crate::platform::memory::system_memory()
+                    .map(|memory| {
+                        let used = memory.total.saturating_sub(memory.available);
+                        let percent = if memory.total > 0 {
+                            used as f64 * 100.0 / memory.total as f64
+                        } else {
+                            0.0
+                        };
+                        format!(
+                            "{} / {} · {:.0}%",
+                            crate::platform::memory::format_gb(used),
+                            crate::platform::memory::format_gb(memory.total),
+                            percent
+                        )
+                    })
+                    .unwrap_or_else(|| "--".to_string()),
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugGpu => SettingView {
+                label: "显卡",
+                kind: SettingKind::Info,
+                value: {
+                    let names = crate::platform::gpu::adapter_names();
+                    if names.is_empty() {
+                        "未检测到".to_string()
+                    } else {
+                        names.join(" / ")
+                    }
+                },
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugRenderer => SettingView {
+                label: "渲染路径",
+                kind: SettingKind::Info,
+                value: if settings.performance.d2d_hardware {
+                    "GDI 主窗口 · Direct2D 硬件覆盖层".to_string()
+                } else {
+                    "GDI 主窗口 · Direct2D 软件覆盖层".to_string()
+                },
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugHandles => SettingView {
+                label: "句柄 / GDI / USER",
+                kind: SettingKind::Info,
+                value: {
+                    let handles = crate::platform::memory::handle_count();
+                    let (gdi, user) = crate::platform::memory::gui_resources();
+                    format!(
+                        "{} / {gdi} / {user}",
+                        handles
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "--".to_string())
+                    )
+                },
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugCaches => SettingView {
+                label: "封面缓存",
+                kind: SettingKind::Info,
+                value: {
+                    let cached = self.core.row_cover_cache_len();
+                    let limit = match settings.performance.thumbnail_cache {
+                        0 => "不限".to_string(),
+                        value => value.to_string(),
+                    };
+                    format!("{cached} / {limit} 张")
+                },
+                active: false,
+                options: &[],
+                selected: None,
+            },
+            SettingField::DebugReleaseMemory => SettingView {
+                label: "释放内存",
+                kind: SettingKind::Action,
+                value: "立即清理封面缓存并整理工作集".to_string(),
+                active: true,
                 options: &[],
                 selected: None,
             },
@@ -3486,6 +3641,22 @@ impl App {
         let Some(field) = self.settings_tab.fields().get(index).copied() else {
             return;
         };
+        // Debug tab: release decoded thumbnails and park unused pages in
+        // standby. The live rows above only display; this is the one action.
+        if field == SettingField::DebugReleaseMemory {
+            let released = self.core.release_cached_images();
+            self.painter_cache_clear_requested = true;
+            self.last_debug_refresh = None;
+            self.core.notify(
+                crate::trf!("已清理 {} 张封面缓存并整理工作集", released),
+                false,
+            );
+            // Show the confirmation immediately; the 2 s diagnostics tick may
+            // be the only other event while playback is paused.
+            self.drain_notices(hwnd);
+            self.invalidate_all(hwnd);
+            return;
+        }
         // Compact choice controls cycle with one click; expand that into the
         // next option index so the per-field arms stay unchanged.
         let option = if option.is_none() && delta > 0 {
@@ -4267,6 +4438,17 @@ impl App {
                 !self.core.settings.download.add_to_library,
             ),
             SettingField::ClearFinishedDownloads => Command::ClearFinishedDownloads,
+            // Debug rows are either read-only Info values or the release
+            // action handled before this match.
+            SettingField::DebugWorkingSet
+            | SettingField::DebugPrivateMemory
+            | SettingField::DebugPeakMemory
+            | SettingField::DebugSystemMemory
+            | SettingField::DebugGpu
+            | SettingField::DebugRenderer
+            | SettingField::DebugHandles
+            | SettingField::DebugCaches
+            | SettingField::DebugReleaseMemory => return,
         };
         self.core.handle(command);
         if field == SettingField::Density {
@@ -5451,6 +5633,19 @@ impl App {
         self.request_visible_covers();
         self.update_visualizer(hwnd);
 
+        // The debug tab's values (memory / handles / GPU) change over time;
+        // refresh them every two seconds while the page is visible instead of
+        // requiring a manual refresh button.
+        if self.debug_tab_active() && self.window_visible {
+            let due = self
+                .last_debug_refresh
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2));
+            if due {
+                self.last_debug_refresh = Some(now);
+                self.invalidate(hwnd, layout::settings(&self.layout).generic);
+            }
+        }
+
         if !after.playing {
             return;
         }
@@ -5914,6 +6109,13 @@ impl App {
                         SettingKind::Text => {
                             if control.inflate(2.0).contains(x, y) {
                                 return Some(Target::SettingsText(index));
+                            }
+                        }
+                        SettingKind::Info => {
+                            if control.inflate(2.0).contains(x, y) {
+                                // Hover-only target so long adapter names get
+                                // the generic row tooltip; clicks do nothing.
+                                return Some(Target::SettingsRow(index));
                             }
                         }
                     }
@@ -6641,6 +6843,7 @@ impl App {
                                 return;
                             }
                         }
+                        SettingKind::Info => {}
                     }
                 }
                 return;
@@ -8141,6 +8344,7 @@ impl App {
             SettingKind::Color | SettingKind::Action | SettingKind::Text => {
                 self.activate_target(hwnd, Target::SettingsRow(index));
             }
+            SettingKind::Info => {}
         }
     }
 
@@ -8585,6 +8789,17 @@ impl App {
 
     pub fn take_player_panel_closed(&mut self) -> bool {
         std::mem::take(&mut self.player_panel_closed)
+    }
+
+    /// The debug tab shows live diagnostics; the shell keeps a 2 s heartbeat
+    /// running while it is the visible settings page.
+    pub fn debug_tab_active(&self) -> bool {
+        self.page == Page::Settings && self.settings_tab == SettingsTab::Debug
+    }
+
+    /// Consume the debug tab's manual release request (clear painter caches).
+    pub fn take_painter_cache_clear(&mut self) -> bool {
+        std::mem::take(&mut self.painter_cache_clear_requested)
     }
 
     fn progress_time_at(&self, x: f32) -> f32 {

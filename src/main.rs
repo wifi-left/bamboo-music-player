@@ -3242,11 +3242,15 @@ unsafe fn sync_timer(hwnd: HWND) {
     // current. Overlays interpolate their own clock between position sends.
     let overlay_heartbeat = playing && !visible && (overlay_open || standalone);
     let system_heartbeat = playing && !visible && !overlay_open && !standalone;
+    // The debug tab shows live memory/handle/GPU values; a 2 s heartbeat keeps
+    // them current even when playback is paused and nothing else animates.
+    let debug_live = visible && state.app.debug_tab_active();
     let animate = state.bench.is_some()
         || toast
         || visible_anim
         || overlay_heartbeat
-        || system_heartbeat;
+        || system_heartbeat
+        || debug_live;
     if animate {
         let frame = state.app.core.settings.performance.frame_millis() as u32;
         let interval = if state.bench.is_some() || visible_anim {
@@ -3255,6 +3259,8 @@ unsafe fn sync_timer(hwnd: HWND) {
             // The overlay needs a new position message every 250 ms; its own
             // render timer smooths the motion in between.
             250
+        } else if debug_live && !toast {
+            2000
         } else {
             // Toast expiry or a hidden player: a 1 s heartbeat is plenty.
             1000
@@ -5385,6 +5391,12 @@ unsafe extern "system" fn window_proc(
             let (color_request, bg_pick, font_pick, lyrics_font_pick, large_font_pick, theme_font_pick) =
                 if let Some(state) = unsafe { state_mut(hwnd) } {
                     state.app.on_release(hwnd);
+                    if state.app.take_painter_cache_clear() {
+                        state.painter.clear_image_cache();
+                        // The core already trimmed once; the painter's freed
+                        // BGRA pages are released by this second pass.
+                        crate::core::platform::memory::trim_working_set();
+                    }
                     sync_native_brushes(state);
                     sync_lyrics(state, hwnd);
                     sync_panel(state, hwnd);
@@ -5601,6 +5613,9 @@ unsafe extern "system" fn window_proc(
                 state.app.invalidate_all(hwnd);
                 unsafe { sync_timer(hwnd) };
             }
+            // Switching to/from the Debug tab starts or stops its 2 s live
+            // diagnostics heartbeat even while playback is paused.
+            unsafe { sync_timer(hwnd) };
             LRESULT(0)
         }
         WM_MOUSEMOVE => {

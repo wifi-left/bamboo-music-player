@@ -961,7 +961,13 @@ impl Painter {
             Page::Smart => app.smart_status(),
             Page::Duplicates => app.duplicate_status(),
             Page::Downloads => app.downloads_status(),
-            Page::Settings => crate::i18n::tr("修改后自动保存").to_string(),
+            Page::Settings => {
+                if app.settings_tab == crate::app::SettingsTab::Debug {
+                    crate::i18n::tr("实时诊断 · 每 2 秒刷新").to_string()
+                } else {
+                    crate::i18n::tr("修改后自动保存").to_string()
+                }
+            }
         };
         let subtitle_right = match app.page {
             // The four library actions live in the header's right corner.
@@ -2668,6 +2674,24 @@ impl Painter {
                         );
                     }
                 }
+                crate::app::SettingKind::Info => {
+                    // Read-only diagnostic value; live values are recomputed
+                    // by `settings_views` on the debug tab's 2 s heartbeat.
+                    self.text(
+                        hdc,
+                        FontKind::Body,
+                        &view.value,
+                        control.inset(8.0, 0.0),
+                        self.pal.accent_text,
+                        DT_RIGHT.0
+                            | DT_SINGLELINE.0
+                            | DT_VCENTER.0
+                            | DT_END_ELLIPSIS.0
+                            | DT_NOPREFIX.0,
+                        scale,
+                        dpi,
+                    );
+                }
                 crate::app::SettingKind::Text => {
                     let editing = app.is_text_edit_row(index);
                     let state = app.button_state(Target::SettingsText(index), false);
@@ -3630,8 +3654,15 @@ impl Painter {
     /// the paint thread exactly once per image (about 1.6 MB for a 640²
     /// sticker), so keeping it out of `StretchDIBits` saves a full copy per
     /// frame.
-    fn cached_cover(&mut self, image: &RgbaImage) -> Option<&CoverPixels> {
-        let key = image.id;
+    /// Drop converted cover pixels and the cached blurred backdrop. Used by
+    /// the settings debug page's manual "release memory" action.
+    pub fn clear_image_cache(&mut self) {
+        self.images.clear();
+        self.background = None;
+        self.background_key = (0, true, [0, 0, 0], 0, 0, 0);
+    }
+
+    fn cached_cover(&mut self, image: &RgbaImage) -> Option<&CoverPixels> {        let key = image.id;
         if !self.images.contains_key(&key) {
             let (w, h) = (image.size[0] as i32, image.size[1] as i32);
             if w <= 0 || h <= 0 || image.pixels.len() < (w * h * 4) as usize {

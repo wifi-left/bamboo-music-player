@@ -2977,6 +2977,24 @@ impl AppCore {
         self.row_covers.images.get(&key)?.as_deref()
     }
 
+    /// Number of decoded row thumbnails currently held in memory.
+    pub fn row_cover_cache_len(&self) -> usize {
+        self.row_covers.images.len()
+    }
+
+    /// Debug page: drop decoded thumbnails and trim the working set.
+    /// Returns the number of thumbnails that were released.
+    pub fn release_cached_images(&mut self) -> usize {
+        let released = self.row_covers.images.len();
+        self.row_covers.images.clear();
+        self.row_covers.order.clear();
+        // Inflight decodes are left alone: their results are small, already
+        // paid for, and clearing the set would only schedule duplicates.
+        self.row_covers.rev = self.row_covers.rev.wrapping_add(1);
+        crate::platform::memory::trim_working_set();
+        released
+    }
+
     /// Queue a thumbnail for a row if it has not been requested yet. The UI
     /// calls this for its visible window; IO/decoding stays off this thread.
     pub fn ensure_row_cover(&mut self, path: &Path) {

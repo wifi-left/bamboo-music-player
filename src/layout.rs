@@ -190,8 +190,9 @@ pub struct Layout {
 /// Rectangles for the Settings page. Computed from the same layout so
 /// painting and hit-testing cannot drift apart.
 pub struct SettingsLayout {
-    /// 曲库 / 播放 / 歌词 / 独立 / 桌面 / 迷你 / 窗口 / 外观 / 性能 / 系统 / 网络 / 存储.
-    pub tabs: [Rect; 13],
+    /// 曲库 / 播放 / 歌词 / 独立 / 桌面 / 迷你 / 窗口 / 外观 / 性能 / 系统 / 网络 / 存储 /
+    /// 快捷键 / 调试.
+    pub tabs: [Rect; 14],
     /// Y position of the first content row (below the tabs).
     pub top: f32,
     pub scan_toggle: Rect,
@@ -224,19 +225,21 @@ pub fn settings(layout: &Layout) -> SettingsLayout {
     let tab_height = 28.0;
     let row_gap = 4.0;
     let tabs_top = layout.header.bottom + 8.0;
-    let mut tabs = [Rect::default(); 13];
+    let mut tabs = [Rect::default(); 14];
     // Flow layout: fill the width from the left and wrap when the next tab no
-    // longer fits. Prefer a column count that divides the tab count evenly so
-    // the last row is not left half-empty (12 → 6×2 on wide windows, 4×3 /
-    // 3×4 when narrow). A prime count such as 13 has no divisor above 1, so
-    // fall back to the maximum number of columns that fits.
+    // longer fits. Prefer a column count that divides the tab count evenly and
+    // keeps the tabs to at most two rows (14 → 7×2 on wide windows); when the
+    // window is too narrow for that, fall back to the maximum number of
+    // columns that fits so the control area keeps its height.
     let available = (right - left).max(1.0);
     let min_tab = 96.0;
     let max_columns = (((available + tab_gap) / (min_tab + tab_gap)).floor() as usize)
         .clamp(1, tabs.len());
     let columns = (2..=max_columns)
         .rev()
-        .find(|count| tabs.len() % count == 0)
+        .find(|count| {
+            tabs.len() % count == 0 && tabs.len().div_ceil(*count) <= 2
+        })
         .unwrap_or(max_columns);
     let tab_width =
         ((available - tab_gap * (columns.saturating_sub(1)) as f32) / columns as f32).max(1.0);
@@ -1166,13 +1169,13 @@ mod tests {
         let layout = compute_with(1200.0, 800.0, false, false);
         let settings = settings(&layout);
         let right = layout.content.right - 32.0;
-        // 13 tabs have no divisor above 1, so the flow uses the maximum
-        // number of columns that fits (9 here) and wraps the rest.
-        assert!(settings.tabs[8].right <= right + 0.5);
-        assert!((settings.tabs[8].right - right).abs() < 0.5);
+        // 14 tabs prefer a divisor that yields two rows, so wide windows use
+        // 7×2 and the first row ends exactly at the right edge.
+        assert!((settings.tabs[6].right - right).abs() < 0.5);
         assert!(settings.tabs[0].width() > 90.0);
-        assert!(settings.tabs[9].top > settings.tabs[8].top);
-        assert!(settings.tabs[9].left <= settings.tabs[0].left + 0.5);
+        assert!(settings.tabs[7].top > settings.tabs[6].top);
+        assert!(settings.tabs[7].left <= settings.tabs[0].left + 0.5);
+        assert!((settings.tabs[13].right - right).abs() < 0.5);
     }
 
     #[test]

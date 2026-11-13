@@ -5,6 +5,7 @@
 //! native shell owns its window. The tray is migrated without `egui::Context`
 //! and wakes the native shell through a host-supplied callback.
 
+pub mod gpu;
 pub mod ipc;
 pub mod jump_list;
 pub mod memory;

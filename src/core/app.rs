@@ -899,6 +899,11 @@ impl AppCore {
             session.volume = settings.playback.volume;
         }
         crate::i18n::set_language(settings.language);
+        // Embedded artwork is part of the (optional) song-metadata analysis;
+        // with it off, cover lookup must not open and parse every file.
+        crate::util::metadata::set_embedded_covers_enabled(
+            settings.performance.metadata_mode.enabled(),
+        );
 
         let search_cache_path = paths.cache.join("search.json");
         let search_cache = SearchCache::load(&search_cache_path);
@@ -1753,8 +1758,12 @@ impl AppCore {
                 self.settings_dirty = true;
             }
             Command::SetMetadataMode(mode) => {
+                let changed = self.settings.performance.metadata_mode != mode;
                 self.settings.performance.metadata_mode = mode;
                 self.settings_dirty = true;
+                if changed {
+                    self.apply_metadata_mode();
+                }
             }
             Command::SetLoadCovers(on) => {
                 self.settings.performance.load_covers = on;
@@ -3198,6 +3207,24 @@ impl AppCore {
         self.row_covers.rev = self.row_covers.rev.wrapping_add(1);
         crate::platform::memory::trim_working_set();
         released
+    }
+
+    /// The song-metadata analysis was toggled: embedded artwork may have
+    /// become available (or unavailable), so covers decoded under the previous
+    /// policy have to be dropped and requested again.
+    fn apply_metadata_mode(&mut self) {
+        crate::util::metadata::set_embedded_covers_enabled(
+            self.settings.performance.metadata_mode.enabled(),
+        );
+        if !self.row_covers.images.is_empty() {
+            self.row_covers.images.clear();
+            self.row_covers.order.clear();
+            self.row_covers.rev = self.row_covers.rev.wrapping_add(1);
+        }
+        if let Some(track) = self.current_track.clone() {
+            self.cover.key.clear();
+            self.refresh_cover(&track);
+        }
     }
 
     /// Queue a thumbnail for a row if it has not been requested yet. The UI
@@ -6292,9 +6319,14 @@ impl AppCore {
 
     /// Re-apply runtime services after every setting changed at once.
     fn apply_settings(&mut self, settings: Settings) {
+        let metadata_changed =
+            settings.performance.metadata_mode != self.settings.performance.metadata_mode;
         self.settings = settings;
         self.settings_dirty = true;
         self.session_dirty = true;
+        if metadata_changed {
+            self.apply_metadata_mode();
+        }
         self.engine.set_volume(self.settings.playback.volume);
         self.engine.set_muted(self.settings.playback.muted);
         self.engine.set_dsp(dsp_config(&self.settings));

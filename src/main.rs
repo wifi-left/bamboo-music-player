@@ -126,6 +126,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::app::{App, Page};
+use crate::core::library::LibrarySort;
 use crate::core::model::{RepeatMode, Track, TrackSource};
 use crate::core::platform::jump_list;
 use crate::core::platform::notify;
@@ -438,6 +439,9 @@ struct Mode {
     self_test: bool,
     bench: Option<f32>,
     page: Option<String>,
+    /// `--sort <name>` for reproducing list-order reports without clicking the
+    /// sort menu (test/diagnostic helper, never persisted).
+    sort: Option<LibrarySort>,
     settings_tab: Option<usize>,
     theme: Option<crate::config::ThemeMode>,
     library: Option<std::path::PathBuf>,
@@ -666,6 +670,25 @@ fn parse_mode() -> Mode {
             args.iter()
                 .find_map(|arg| arg.strip_prefix("--page=").map(str::to_string))
         });
+    let sort = args
+        .iter()
+        .position(|arg| arg == "--sort")
+        .and_then(|position| args.get(position + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("--sort=").map(str::to_string))
+        })
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "title" => Some(LibrarySort::Title),
+            "artist" => Some(LibrarySort::Artist),
+            "album" => Some(LibrarySort::Album),
+            "added" | "recent" => Some(LibrarySort::Added),
+            "duration" | "length" => Some(LibrarySort::Duration),
+            "plays" | "playcount" => Some(LibrarySort::PlayCount),
+            "played" | "lastplayed" => Some(LibrarySort::LastPlayed),
+            "path" => Some(LibrarySort::Path),
+            _ => None,
+        });
     let settings_tab = args
         .iter()
         .position(|arg| arg == "--settings-tab")
@@ -717,6 +740,7 @@ fn parse_mode() -> Mode {
         self_test,
         bench,
         page,
+        sort,
         settings_tab,
         theme,
         library,
@@ -905,6 +929,11 @@ fn run() -> windows::core::Result<u8> {
                 _ => crate::app::Page::NowPlaying,
             };
             model.set_page(page);
+        }
+        if let Some(sort) = mode.sort {
+            model
+                .core
+                .handle(crate::core::app::Command::LibrarySetSort(sort));
         }
         if let Some(tab) = mode.settings_tab {
             model.settings_tab =

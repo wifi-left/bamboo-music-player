@@ -60,33 +60,70 @@ pub fn read_local_with_cover(path: &Path, with_cover: bool) -> Option<LocalMeta>
     Some(meta)
 }
 
-/// Embedded picture, then common sidecar cover names in the same folder.
-pub fn cover_bytes(path: &Path) -> Option<Vec<u8>> {
-    if let Some(meta) = read_local_with_cover(path, true) {
-        if let Some(cover) = meta.cover {
-            return Some(cover);
-        }
-    }
-    let candidate = sidecar_cover_path(path)?;
-    std::fs::read(candidate).ok()
+/// `cover_bytes` may read the embedded picture only while the "read song
+/// metadata" analysis is enabled; with analysis off, opening every file just
+/// to look for artwork would defeat that setting.
+static EMBEDDED_COVERS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_embedded_covers_enabled(enabled: bool) {
+    EMBEDDED_COVERS.store(enabled, Ordering::Relaxed);
 }
 
+fn embedded_covers_enabled() -> bool {
+    EMBEDDED_COVERS.load(Ordering::Relaxed)
+}
+
+/// Cover resolution order:
+///
+/// 1. Artwork embedded in the file itself — the strongest per-song signal.
+///    Only read when song-data analysis is enabled (`MetadataMode`).
+/// 2. A picture named after the song (`<stem>.jpg` / `.png`); it belongs to
+///    that song only, so `a - b.jpg` never becomes `a - c`'s cover.
+/// 3. Otherwise `cover.jpg` / `cover.png` in the folder, for the remaining
+///    files there.
+///
+/// `folder.jpg` / `front.jpg` / ... are deliberately not treated as folder
+/// covers: a catch-all directory with one such image would show the same
+/// picture for hundreds of unrelated songs.
+pub fn cover_bytes(path: &Path) -> Option<Vec<u8>> {
+    if embedded_covers_enabled()
+        && let Some(meta) = read_local_with_cover(path, true)
+        && let Some(cover) = meta.cover
+    {
+        return Some(cover);
+    }
+    if let Some(candidate) = stem_cover_path(path)
+        && let Ok(bytes) = std::fs::read(candidate)
+    {
+        return Some(bytes);
+    }
+    if let Some(candidate) = sidecar_cover_path(path)
+        && let Ok(bytes) = std::fs::read(candidate)
+    {
+        return Some(bytes);
+    }
+    None
+}
+
+fn stem_cover_path(path: &Path) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let stem = path.file_stem()?.to_string_lossy();
+    if stem.is_empty() {
+        return None;
+    }
+    for extension in ["jpg", "jpeg", "png"] {
+        let candidate = dir.join(format!("{stem}.{extension}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Folder-wide cover: only the explicit `cover.*` names.
 pub fn sidecar_cover_path(path: &Path) -> Option<PathBuf> {
     let dir = path.parent()?;
-    for name in [
-        "cover.jpg",
-        "cover.jpeg",
-        "cover.png",
-        "folder.jpg",
-        "folder.jpeg",
-        "folder.png",
-        "front.jpg",
-        "front.jpeg",
-        "front.png",
-        "album.jpg",
-        "album.jpeg",
-        "album.png",
-    ] {
+    for name in ["cover.jpg", "cover.jpeg", "cover.png"] {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
@@ -170,5 +207,48 @@ impl MetadataService {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn song_named_picture_wins_over_the_folder_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a - b.mp3");
+        let second = dir.path().join("a - c.mp3");
+        write(&first, b"not a real mp3");
+        write(&second, b"not a real mp3");
+        write(&dir.path().join("a - b.jpg"), b"song-art");
+        write(&dir.path().join("cover.jpg"), b"folder-art");
+        // The specific picture stays with its own file ...
+        assert_eq!(cover_bytes(&first).as_deref(), Some(&b"song-art"[..]));
+        // ... and the folder cover serves the other songs.
+        assert_eq!(cover_bytes(&second).as_deref(), Some(&b"folder-art"[..]));
+    }
+
+    #[test]
+    fn folder_cover_is_the_fallback_for_other_songs() {
+        let dir = tempfile::tempdir().unwrap();
+        let song = dir.path().join("a.mp3");
+        write(&song, b"not a real mp3");
+        write(&dir.path().join("cover.png"), b"folder-art");
+        assert_eq!(cover_bytes(&song).as_deref(), Some(&b"folder-art"[..]));
+    }
+
+    #[test]
+    fn folder_and_front_images_are_not_folder_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let song = dir.path().join("a.mp3");
+        write(&song, b"not a real mp3");
+        write(&dir.path().join("Folder.jpg"), b"folder-art");
+        write(&dir.path().join("front.png"), b"front-art");
+        assert!(cover_bytes(&song).is_none());
     }
 }

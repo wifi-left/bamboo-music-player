@@ -114,11 +114,12 @@ Windows 原生音乐播放器。主窗口使用 Win32 + GDI 自绘，Direct2D �
 - Tab 焦点环覆盖侧栏、播放条、页面工具栏、设置行和可见列表行；
   Enter/Space 激活，音量/进度支持方向键与 Home/End；主窗口、独立歌词、
   桌面歌词、迷你播放器都有 UI Automation 片段树。
-- `cargo test`：258 passed / 0 failed / 6 ignored。
+- `cargo test`：263 passed / 0 failed / 6 ignored。
 - `--self-test` 验证窗口与绘制；`--bench [秒]` 输出 tick/帧数、绘制耗时与私有内存。
 - 测试辅助：`--page <now_playing|queue|library|folders|search|discover|smart|duplicates|stats|downloads|settings>`、
+  `--sort <title|artist|album|added|duration|plays|played|path>`、
   `--folder <dir>`、`--settings-tab 0..14`、`--theme <dark|light|system>`
-  （后两者只影响本次运行，不写回配置）。
+  （后几个只影响本次运行，不写回配置）。
 
 待办与验收矩阵见 [`HANDOFF.md`](HANDOFF.md)。
 

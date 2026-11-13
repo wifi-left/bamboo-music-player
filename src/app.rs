@@ -1834,63 +1834,34 @@ impl App {
     /// Multi-line hover tooltip for a queue or library row.
     pub fn row_tooltip(&self, index: usize) -> Option<String> {
         let snapshot = self.core.snapshot();
-        if self.page == Page::Search {
-            let song = snapshot.online.rows().get(index)?;
-            let mut lines = vec![song.name.clone()];
-            let mut sub = Vec::new();
-            if !song.artist.trim().is_empty() {
-                sub.push(song.artist.trim().to_string());
-            }
-            if !song.album.trim().is_empty() {
-                sub.push(song.album.trim().to_string());
-            }
-            if !sub.is_empty() {
-                lines.push(sub.join(" · "));
-            }
-            let mut meta = Vec::new();
-            if let Some(date) = song.release_date.as_deref() {
-                meta.push(date.to_string());
-            }
-            if let Some(addition) = song.addition.as_deref() {
-                meta.push(addition.to_string());
-            }
-            if !meta.is_empty() {
-                lines.push(meta.join(" · "));
-            }
-            lines.push(format!("在线曲目 ID {}", song.id));
-            return Some(lines.join("\r\n"));
+        if matches!(self.page, Page::Search | Page::Discover) {
+            let song = if self.page == Page::Search {
+                snapshot.online.rows().get(index)?
+            } else {
+                snapshot.discover.songs.get(index)?
+            };
+            return Some(Self::online_song_tooltip(song));
         }
-        if self.page == Page::Library {
-            let entry = snapshot.library.get(index)?;
-            let mut lines = vec![entry.title.clone()];
-            let mut sub = Vec::new();
-            if !entry.artist.trim().is_empty() {
-                sub.push(entry.artist.trim().to_string());
-            }
-            if !entry.album.trim().is_empty() {
-                sub.push(entry.album.trim().to_string());
-            }
-            if !sub.is_empty() {
-                lines.push(sub.join(" · "));
-            }
-            let mut meta = Vec::new();
-            if !entry.format.trim().is_empty() {
-                meta.push(entry.format.to_ascii_uppercase());
-            }
-            if let Some(duration) = entry.duration {
-                meta.push(crate::paint::format_time(duration as f32));
-            }
-            if entry.play_count > 0 {
-                meta.push(format!("播放 {} 次", entry.play_count));
-            }
-            if entry.missing {
-                meta.push("文件缺失".to_string());
-            }
-            if !meta.is_empty() {
-                lines.push(meta.join(" · "));
-            }
-            lines.push(entry.path.display().to_string());
-            return Some(lines.join("\r\n"));
+        if matches!(self.page, Page::Library | Page::Smart | Page::Duplicates) {
+            let entry = match self.page {
+                Page::Smart => snapshot.library_smart.get(index)?,
+                Page::Duplicates => {
+                    // Group headers label a section; they are not files, so
+                    // there is nothing to describe (and the row is not a
+                    // queue index either).
+                    if snapshot
+                        .library_duplicate_headers
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    snapshot.library_duplicate_rows.get(index)?
+                }
+                _ => snapshot.library.get(index)?,
+            };
+            return Some(Self::library_entry_tooltip(entry));
         }
 
         if self.page == Page::Folders {
@@ -1908,6 +1879,31 @@ impl App {
                 kind,
                 entry.path.display()
             ));
+        }
+
+        if self.page == Page::Downloads {
+            let row = snapshot.downloads.get(index)?;
+            let mut lines = vec![row.title.clone()];
+            if !row.artist.trim().is_empty() {
+                lines.push(row.artist.clone());
+            }
+            let mut meta = vec![row.state.label().to_string()];
+            if row.state.is_active()
+                && let Some(total) = row.total.filter(|total| *total > 0)
+            {
+                let percent = (row.received as f64 * 100.0 / total as f64).min(100.0);
+                meta.push(format!("{percent:.0}%"));
+            }
+            if let Some(quality) = row.quality() {
+                meta.push(quality.label().to_string());
+            }
+            lines.push(meta.join(" · "));
+            if let Some(error) = row.error.as_deref() {
+                lines.push(error.to_string());
+            } else if let Some(path) = row.path.as_ref() {
+                lines.push(path.display().to_string());
+            }
+            return Some(lines.join("\r\n"));
         }
 
         let track = snapshot.queue.get(self.queue_index(index)?)?;
@@ -1942,6 +1938,68 @@ impl App {
             TrackSource::Bamboo { song_id, .. } => lines.push(format!("Bamboo · {song_id}")),
         }
         Some(lines.join("\r\n"))
+    }
+
+    /// Tooltip body shared by the library, smart-playlist and duplicates pages.
+    fn library_entry_tooltip(entry: &crate::core::library::LibraryEntry) -> String {
+        let mut lines = vec![entry.title.clone()];
+        let mut sub = Vec::new();
+        if !entry.artist.trim().is_empty() {
+            sub.push(entry.artist.trim().to_string());
+        }
+        if !entry.album.trim().is_empty() {
+            sub.push(entry.album.trim().to_string());
+        }
+        if !sub.is_empty() {
+            lines.push(sub.join(" · "));
+        }
+        let mut meta = Vec::new();
+        if !entry.format.trim().is_empty() {
+            meta.push(entry.format.to_ascii_uppercase());
+        }
+        if let Some(duration) = entry.duration {
+            meta.push(crate::paint::format_time(duration as f32));
+        }
+        if entry.play_count > 0 {
+            meta.push(format!("播放 {} 次", entry.play_count));
+        }
+        if entry.missing {
+            meta.push("文件缺失".to_string());
+        }
+        if !meta.is_empty() {
+            lines.push(meta.join(" · "));
+        }
+        if !entry.path.as_os_str().is_empty() {
+            lines.push(entry.path.display().to_string());
+        }
+        lines.join("\r\n")
+    }
+
+    /// Tooltip body shared by online search results and the discover batch.
+    fn online_song_tooltip(song: &crate::api::ApiSong) -> String {
+        let mut lines = vec![song.name.clone()];
+        let mut sub = Vec::new();
+        if !song.artist.trim().is_empty() {
+            sub.push(song.artist.trim().to_string());
+        }
+        if !song.album.trim().is_empty() {
+            sub.push(song.album.trim().to_string());
+        }
+        if !sub.is_empty() {
+            lines.push(sub.join(" · "));
+        }
+        let mut meta = Vec::new();
+        if let Some(date) = song.release_date.as_deref() {
+            meta.push(date.to_string());
+        }
+        if let Some(addition) = song.addition.as_deref() {
+            meta.push(addition.to_string());
+        }
+        if !meta.is_empty() {
+            lines.push(meta.join(" · "));
+        }
+        lines.push(format!("在线曲目 ID {}", song.id));
+        lines.join("\r\n")
     }
 
     pub fn library_sort_label(&self) -> &'static str {
@@ -9330,5 +9388,51 @@ mod tests {
         assert!(style_is_transparent(WS_EX_TRANSPARENT.0));
         assert!(style_is_transparent(WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0));
         assert!(!style_is_transparent(0));
+    }
+
+    #[test]
+    fn library_tooltip_includes_the_file_path() {
+        let entry = crate::core::library::LibraryEntry {
+            key: "local:e:\\music\\a.mp3".to_string(),
+            path: std::path::PathBuf::from(r"E:\music\a.mp3"),
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            duration: Some(240.0),
+            play_count: 3,
+            last_played_at: None,
+            lossless: false,
+            format: "mp3".to_string(),
+            missing: false,
+            size: 0,
+        };
+        let text = App::library_entry_tooltip(&entry);
+        assert!(text.contains("Title"));
+        assert!(text.contains("MP3"));
+        assert!(text.contains(r"E:\music\a.mp3"));
+    }
+
+    #[test]
+    fn duplicate_group_header_has_no_file_path() {
+        // `rebuild_duplicate_rows` stores a placeholder entry for each group
+        // header. Its tooltip must not fall back to a path (or, worse, to a
+        // queue row with the same index).
+        let header = crate::core::library::LibraryEntry {
+            key: "__group_0".to_string(),
+            path: std::path::PathBuf::new(),
+            title: "副本组 1 · Song".to_string(),
+            artist: "2 个文件".to_string(),
+            album: String::new(),
+            duration: None,
+            play_count: 0,
+            last_played_at: None,
+            lossless: false,
+            format: String::new(),
+            missing: false,
+            size: 0,
+        };
+        let text = App::library_entry_tooltip(&header);
+        assert!(text.contains("副本组 1"));
+        assert!(!text.contains(r"E:\"));
     }
 }

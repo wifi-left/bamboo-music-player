@@ -23,8 +23,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::core::app::{AppCore, Command};
 use crate::core::config::{
-    CloseBehavior, DedupeMode, EqPreset, ListDensity, LyricsAlign, LyricsPanelBackground,
-    Paths, ReplayGainMode, ShortcutSlot, ThemeMode,
+    CloseBehavior, DedupeMode, EqPreset, GamepadSlot, ListDensity, LyricsAlign,
+    LyricsPanelBackground, Paths, ReplayGainMode, ShortcutSlot, ThemeMode,
 };
 use crate::core::library::LibrarySort;
 use crate::core::model::{Page as CorePage, Track, TrackSource};
@@ -438,7 +438,10 @@ pub enum SettingField {
     /// Global hotkeys.
     ShortcutsEnabled,
     GamepadEnabled,
+    GamepadUiEnabled,
+    GamepadFullscreenOnlyChords,
     Shortcut(ShortcutSlot),
+    GamepadShortcut(GamepadSlot),
     ResetShortcuts,
     ExportSettings,
     ImportSettings,
@@ -566,9 +569,8 @@ const SYSTEM_FIELDS: [SettingField; 10] = [
     SettingField::ResetSettings,
 ];
 
-const SHORTCUTS_FIELDS: [SettingField; 14] = [
+const SHORTCUTS_FIELDS: [SettingField; 25] = [
     SettingField::ShortcutsEnabled,
-    SettingField::GamepadEnabled,
     SettingField::Shortcut(ShortcutSlot::PlayPause),
     SettingField::Shortcut(ShortcutSlot::Next),
     SettingField::Shortcut(ShortcutSlot::Prev),
@@ -580,6 +582,18 @@ const SHORTCUTS_FIELDS: [SettingField; 14] = [
     SettingField::Shortcut(ShortcutSlot::CopyTitle),
     SettingField::Shortcut(ShortcutSlot::FillLyric),
     SettingField::Shortcut(ShortcutSlot::FillTitle),
+    SettingField::GamepadEnabled,
+    SettingField::GamepadUiEnabled,
+    SettingField::GamepadFullscreenOnlyChords,
+    SettingField::GamepadShortcut(GamepadSlot::PlayPause),
+    SettingField::GamepadShortcut(GamepadSlot::Next),
+    SettingField::GamepadShortcut(GamepadSlot::Prev),
+    SettingField::GamepadShortcut(GamepadSlot::VolumeUp),
+    SettingField::GamepadShortcut(GamepadSlot::VolumeDown),
+    SettingField::GamepadShortcut(GamepadSlot::SeekBack),
+    SettingField::GamepadShortcut(GamepadSlot::SeekForward),
+    SettingField::GamepadShortcut(GamepadSlot::ToggleDesktopLyrics),
+    SettingField::GamepadShortcut(GamepadSlot::ShowHide),
     SettingField::ResetShortcuts,
 ];
 
@@ -972,6 +986,10 @@ pub struct App {    pub dpi: f32,
     background_image_pick_requested: bool,
     /// Settings row currently waiting for a key combination.
     pub shortcut_capture: Option<ShortcutSlot>,
+    /// Gamepad row currently waiting for a button chord.
+    pub gamepad_capture: Option<GamepadSlot>,
+    /// Buttons held so far during gamepad capture, shown as a live preview.
+    gamepad_capture_mask: u32,
     /// Keyboard focus ring target (`Tab` navigation).
     keyboard_focus: Option<Target>,
     /// Scroll offset of the sidebar navigation when the window is short.
@@ -1151,6 +1169,8 @@ impl App {
             settings_scroll: 0.0,
             background_image_pick_requested: false,
             shortcut_capture: None,
+            gamepad_capture: None,
+            gamepad_capture_mask: 0,
             keyboard_focus: None,
             sidebar_scroll: 0.0,
             dragging_sidebar_scrollbar: false,
@@ -2042,6 +2062,11 @@ impl App {
         }
         self.settings_tab = tab;
         self.settings_scroll = 0.0;
+        // The row that owned a capture is gone; drop the pending binding
+        // instead of leaving the keyboard/gamepad in capture mode.
+        self.shortcut_capture = None;
+        self.gamepad_capture = None;
+        self.gamepad_capture_mask = 0;
         self.ui.clear();
         if self.player_panel_open {
             self.set_player_panel(hwnd, false);
@@ -2257,7 +2282,35 @@ impl App {
             }
             SettingField::GamepadEnabled => {
                 toggle(crate::i18n::tr("手柄控制"), settings.shortcuts.gamepad)
-            }            SettingField::Shortcut(slot) => SettingView {
+            }
+            SettingField::GamepadUiEnabled => toggle(
+                crate::i18n::tr("手柄界面操作（窗口聚焦时）"),
+                settings.shortcuts.gamepad_ui,
+            ),
+            SettingField::GamepadFullscreenOnlyChords => toggle(
+                crate::i18n::tr("全屏应用时仅响应组合键"),
+                settings.shortcuts.gamepad_fullscreen_only_chords,
+            ),
+            SettingField::GamepadShortcut(slot) => SettingView {
+                label: crate::i18n::tr(slot.label()),
+                kind: SettingKind::Action,
+                value: if self.gamepad_capture == Some(slot) {
+                    match crate::gamepad::format(self.gamepad_capture_mask) {
+                        Some(preview) => {
+                            crate::trf!("{}（松开确认）", preview)
+                        }
+                        None => crate::i18n::tr("按下手柄组合…（Esc 清除）").to_string(),
+                    }
+                } else if settings.shortcuts.gamepad_get(slot).trim().is_empty() {
+                    crate::i18n::tr("未设置").to_string()
+                } else {
+                    settings.shortcuts.gamepad_get(slot).to_string()
+                },
+                active: settings.shortcuts.gamepad,
+                options: &[],
+                selected: None,
+            },
+            SettingField::Shortcut(slot) => SettingView {
                 label: crate::i18n::tr(slot.label()),
                 kind: SettingKind::Action,
                 value: if self.shortcut_capture == Some(slot) {
@@ -3960,6 +4013,28 @@ impl App {
             SettingField::GamepadEnabled => {
                 Command::SetGamepadEnabled(!self.core.settings.shortcuts.gamepad)
             }
+            SettingField::GamepadUiEnabled => {
+                Command::SetGamepadUiEnabled(!self.core.settings.shortcuts.gamepad_ui)
+            }
+            SettingField::GamepadFullscreenOnlyChords => Command::SetGamepadFullscreenOnlyChords(
+                !self
+                    .core
+                    .settings
+                    .shortcuts
+                    .gamepad_fullscreen_only_chords,
+            ),
+            SettingField::GamepadShortcut(slot) => {
+                // The next chord released on the controller is captured.
+                self.gamepad_capture = if self.gamepad_capture == Some(slot) {
+                    None
+                } else {
+                    Some(slot)
+                };
+                self.gamepad_capture_mask = 0;
+                self.shortcut_capture = None;
+                self.invalidate(hwnd, self.layout.content);
+                return;
+            }
             SettingField::Shortcut(slot) => {
                 // Click again (or click another row) to leave capture mode.
                 self.shortcut_capture = if self.shortcut_capture == Some(slot) {
@@ -3967,6 +4042,8 @@ impl App {
                 } else {
                     Some(slot)
                 };
+                self.gamepad_capture = None;
+                self.gamepad_capture_mask = 0;
                 self.invalidate(hwnd, self.layout.content);
                 return;
             }
@@ -4719,6 +4796,68 @@ impl App {
         }
         self.core.handle(Command::SetShortcut(slot, combo));
         self.core.flush_settings();
+    }
+
+    /// A settings row is waiting for a gamepad chord.
+    pub fn gamepad_capture_active(&self) -> bool {
+        self.gamepad_capture.is_some()
+    }
+
+    /// Accumulate held buttons so the row can preview the chord while the user
+    /// is still pressing it.
+    pub fn update_gamepad_capture(&mut self, hwnd: HWND, down: u32) {
+        if self.gamepad_capture.is_none() {
+            return;
+        }
+        let next = self.gamepad_capture_mask | down;
+        if next != self.gamepad_capture_mask {
+            self.gamepad_capture_mask = next;
+            self.invalidate(hwnd, self.layout.content);
+        }
+    }
+
+    /// Finish gamepad capture once every button is released. A chord that is a
+    /// duplicate of another slot is rejected so two actions cannot share it.
+    pub fn commit_gamepad_capture(&mut self, hwnd: HWND) {
+        let Some(slot) = self.gamepad_capture else {
+            return;
+        };
+        let mask = std::mem::take(&mut self.gamepad_capture_mask);
+        if mask == 0 {
+            return;
+        }
+        let Some(combo) = crate::gamepad::format(mask) else {
+            self.push_toast(hwnd, crate::i18n::tr("手柄组合无效").to_string(), true);
+            return;
+        };
+        let conflict = crate::config::GamepadSlot::ALL
+            .into_iter()
+            .filter(|other| *other != slot)
+            .find(|other| crate::gamepad::parse(self.core.settings.shortcuts.gamepad_get(*other)) == Some(mask));
+        if let Some(other) = conflict {
+            self.push_toast(
+                hwnd,
+                crate::trf!("与“{}”手柄快捷键冲突", other.label()),
+                true,
+            );
+            return;
+        }
+        self.gamepad_capture = None;
+        self.core.handle(Command::SetGamepadShortcut(slot, combo));
+        self.core.flush_settings();
+        self.invalidate(hwnd, self.layout.content);
+    }
+
+    /// Esc during gamepad capture clears the binding instead of cancelling.
+    pub fn cancel_gamepad_capture(&mut self, hwnd: HWND) {
+        let Some(slot) = self.gamepad_capture.take() else {
+            return;
+        };
+        self.gamepad_capture_mask = 0;
+        self.core
+            .handle(Command::SetGamepadShortcut(slot, String::new()));
+        self.core.flush_settings();
+        self.invalidate(hwnd, self.layout.content);
     }
 
     pub fn settings_folder_rows(&self) -> usize {
@@ -6684,6 +6823,10 @@ impl App {
             // again when the clicked row is another shortcut.
             self.invalidate(hwnd, self.layout.content);
         }
+        if self.gamepad_capture.take().is_some() {
+            self.gamepad_capture_mask = 0;
+            self.invalidate(hwnd, self.layout.content);
+        }
         if self.hit_target(x, y) == Some(Target::SidebarScrollbar) {
             self.ui.set_pressed(Some(Target::SidebarScrollbar));
             self.dragging_sidebar_scrollbar = true;
@@ -8579,6 +8722,21 @@ impl App {
         self.keyboard_focus
     }
 
+    /// First gamepad "A" press when no ring is visible. Landing on the first
+    /// sidebar entry would activate a page switch; the play button (or the
+    /// first settings row) is what a controller-only user is reaching for.
+    pub fn reveal_gamepad_focus(&mut self, hwnd: HWND) {
+        if self.keyboard_focus.is_some() {
+            return;
+        }
+        let target = if self.page == Page::Settings && self.settings_tab != SettingsTab::Library {
+            Target::SettingsRow(0)
+        } else {
+            Target::Play
+        };
+        self.focus_target(hwnd, target);
+    }
+
     /// Move the focus ring without activating. Used by UIA SetFocus.
     pub(crate) fn focus_target(&mut self, hwnd: HWND, target: Target) {
         if self.keyboard_focus == Some(target) {
@@ -8894,6 +9052,10 @@ impl App {
         self.page = page;
         // The focus ring belongs to the old page's controls.
         self.keyboard_focus = None;
+        // Capture rows live on the settings page; leaving it cancels them.
+        self.shortcut_capture = None;
+        self.gamepad_capture = None;
+        self.gamepad_capture_mask = 0;
         if let Some(index) = Page::ALL.iter().position(|candidate| *candidate == page) {
             let viewport = self.layout.nav_viewport;
             let item = self.layout.nav[index];

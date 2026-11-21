@@ -51,8 +51,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FONT_CHARSET,
-    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetDC, GetTextMetricsW, HBRUSH, HDC,
-    HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, ReleaseDC,
+    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetDC, GetMonitorInfoW,
+    GetTextMetricsW, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, ReleaseDC,
     PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
     UpdateWindow,
 };
@@ -75,7 +76,8 @@ use windows::Win32::UI::Controls::{
     TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSELEAVE,
 };
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -85,7 +87,7 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, HOT_KEY_MODIFIERS, RegisterHotKey, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    GetFocus, GetKeyState, HOT_KEY_MODIFIERS, RegisterHotKey, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN,
     VK_RWIN, VK_SHIFT,
 };
@@ -94,9 +96,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CW_USEDEFAULT, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow,
     DispatchMessageW,
-    GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GWLP_USERDATA, GWLP_WNDPROC, GetClassNameW, GetClientRect, GetCursorPos,
+    GetForegroundWindow,
     GetMessageW, GetParent, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId,
     GetWindowTextW,
     HWND_TOPMOST, HMENU, IDC_ARROW, IDYES, IsIconic, IsWindowVisible, IsZoomed, KillTimer,
     LoadCursorW,
@@ -146,7 +149,8 @@ use crate::lyrics_window::{
 };
 use crate::overlay_host::{DesktopHost, MiniHost};
 use crate::overlay_protocol::{MiniAction, OverlayAction};
-use crate::gamepad::{Gamepad, GamepadAction};
+use crate::core::config::GamepadSlot;
+use crate::gamepad::{Gamepad, UI_MASK};
 use crate::player_panel::{
     ACTION_AB_CLEAR, ACTION_AB_END, ACTION_AB_START, ACTION_DEVICE_DELTA, ACTION_OPEN_SETTINGS,
     ACTION_SET_SLEEP, ACTION_SET_VOLUME, ACTION_SLEEP_CUSTOM_DELTA, ACTION_SPEED_DOWN,
@@ -433,6 +437,9 @@ struct State {
     /// XInput controller; polled only while connected and enabled.
     gamepad: Gamepad,
     gamepad_running: bool,
+    /// Current `GAMEPAD_TIMER` period. Faster while the player owns the
+    /// foreground so short taps are not missed by 100 ms sampling.
+    gamepad_interval: u32,
 }
 
 struct Mode {
@@ -1260,6 +1267,7 @@ fn run() -> windows::core::Result<u8> {
             shortcuts_applied: None,
             gamepad: Gamepad::new(),
             gamepad_running: false,
+            gamepad_interval: 0,
             last_input: Instant::now(),
             last_trim: Instant::now(),
         });
@@ -2946,7 +2954,7 @@ fn sync_system(state: &mut State, hwnd: HWND) {
 fn sync_shortcuts(state: &mut State, hwnd: HWND) {
     // While a row waits for a combination, release the global keys so typing
     // the new binding cannot trigger the old action.
-    if state.app.shortcut_capture_active() {
+    if state.app.shortcut_capture_active() || state.app.gamepad_capture_active() {
         if state.shortcuts_applied.is_some() {
             for index in 0..SHORTCUT_COUNT {
                 unsafe {
@@ -3005,50 +3013,55 @@ fn sync_shortcuts(state: &mut State, hwnd: HWND) {
     }
 }
 
-/// Real Windows 11 Mica on the title bar (and a matching tint in the client,
-/// drawn by `paint::draw_gradient`). On older builds the call fails silently
-/// and the application gradient remains.
-/// Start/stop XInput polling from the settings toggle and device presence.
+/// Start/stop XInput polling from the settings toggle, capture mode and device
+/// presence. The period follows focus: 40 ms while the player is the active
+/// window (short taps, responsive focus-ring navigation) and 100 ms otherwise.
 fn sync_gamepad(state: &mut State, hwnd: HWND) {
+    // Capture mode must keep polling even while global gamepad shortcuts are
+    // switched off, otherwise a fresh binding could never be recorded.
     let want = state.persist
-        && state.app.core.settings.shortcuts.gamepad
+        && (state.app.core.settings.shortcuts.gamepad || state.app.gamepad_capture_active())
         && state.gamepad.is_connected();
-    if want == state.gamepad_running {
+    if !want {
+        if state.gamepad_running {
+            state.gamepad_running = false;
+            state.gamepad_interval = 0;
+            let _ = unsafe { KillTimer(Some(hwnd), GAMEPAD_TIMER) };
+        }
         return;
     }
-    state.gamepad_running = want;
-    unsafe {
-        if want {
-            let _ = SetTimer(Some(hwnd), GAMEPAD_TIMER, 100, None);
-        } else {
-            let _ = KillTimer(Some(hwnd), GAMEPAD_TIMER);
-        }
+    let interval = if ui_has_focus(hwnd) { 40 } else { 100 };
+    if state.gamepad_running && state.gamepad_interval == interval {
+        return;
     }
+    state.gamepad_running = true;
+    state.gamepad_interval = interval;
+    let _ = unsafe { SetTimer(Some(hwnd), GAMEPAD_TIMER, interval, None) };
 }
 
-fn perform_gamepad_action(state: &mut State, hwnd: HWND, action: GamepadAction) {
-    match action {
-        GamepadAction::PlayPause => state.app.toggle_play(hwnd),
-        GamepadAction::Next => state.app.next(hwnd),
-        GamepadAction::Prev => state.app.prev(hwnd),
-        GamepadAction::VolumeUp => state.app.change_volume(hwnd, 0.05),
-        GamepadAction::VolumeDown => state.app.change_volume(hwnd, -0.05),
-        GamepadAction::SeekBack => {
+fn perform_gamepad_slot(state: &mut State, hwnd: HWND, slot: GamepadSlot) {
+    match slot {
+        GamepadSlot::PlayPause => state.app.toggle_play(hwnd),
+        GamepadSlot::Next => state.app.next(hwnd),
+        GamepadSlot::Prev => state.app.prev(hwnd),
+        GamepadSlot::VolumeUp => state.app.change_volume(hwnd, 0.05),
+        GamepadSlot::VolumeDown => state.app.change_volume(hwnd, -0.05),
+        GamepadSlot::SeekBack => {
             let step = state.app.core.settings.playback.seek_step_secs as f32;
             state.app.seek_by(hwnd, -step);
         }
-        GamepadAction::SeekForward => {
+        GamepadSlot::SeekForward => {
             let step = state.app.core.settings.playback.seek_step_secs as f32;
             state.app.seek_by(hwnd, step);
         }
-        GamepadAction::ToggleDesktopLyrics => {
+        GamepadSlot::ToggleDesktopLyrics => {
             state
                 .app
                 .core
                 .handle(crate::core::app::Command::ToggleDesktopLyrics);
             state.app.invalidate_all(hwnd);
         }
-        GamepadAction::ShowHide => {
+        GamepadSlot::ShowHide => {
             if unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -3064,6 +3077,101 @@ fn perform_gamepad_action(state: &mut State, hwnd: HWND, action: GamepadAction) 
     }
 }
 
+/// Parsed global gamepad bindings, in `GamepadSlot::ALL` order. An empty
+/// string means the action has no gamepad binding.
+fn gamepad_bindings(settings: &crate::config::ShortcutSettings) -> Vec<(GamepadSlot, u32)> {
+    GamepadSlot::ALL
+        .into_iter()
+        .filter_map(|slot| {
+            let text = settings.gamepad_get(slot);
+            if text.trim().is_empty() {
+                return None;
+            }
+            crate::gamepad::parse(text).map(|mask| (slot, mask))
+        })
+        .collect()
+}
+
+/// True when this process owns the foreground window: the main window or the
+/// standalone lyrics window. The overlays are `WS_EX_NOACTIVATE`, so they can
+/// never qualify.
+fn ui_has_focus(hwnd: HWND) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground == hwnd {
+        return true;
+    }
+    if !foreground.0.is_null() {
+        let mut pid = 0u32;
+        let _ = unsafe { GetWindowThreadProcessId(foreground, Some(&mut pid)) };
+        if pid == std::process::id() {
+            return true;
+        }
+    }
+    // `WM_KEYDOWN` only reaches this window while it (or a child) owns the
+    // thread keyboard state; posted keys from the lyrics window are covered by
+    // the process check above.
+    !unsafe { GetFocus() }.0.is_null()
+}
+
+/// A native text editor owns the keyboard. In-window shortcuts must not seek
+/// or scroll while the user is typing into the search box, an address bar or an
+/// inline settings editor.
+fn text_input_has_focus() -> bool {
+    let focus = unsafe { GetFocus() };
+    if focus.0.is_null() {
+        return false;
+    }
+    let mut class = [0u16; 32];
+    let len = unsafe { GetClassNameW(focus, &mut class) }.max(0) as usize;
+    let name = String::from_utf16_lossy(&class[..len.min(class.len())]);
+    name.eq_ignore_ascii_case("Edit")
+}
+
+/// Another process owns its monitor: a fullscreen game. Single-button gamepad
+/// bindings are ignored in that state; chords still work.
+fn other_app_fullscreen() -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    let _ = unsafe { GetWindowThreadProcessId(foreground, Some(&mut pid)) };
+    if pid == std::process::id() {
+        return false;
+    }
+    let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return false;
+    }
+    let mut rect = RECT::default();
+    // Strip the invisible resize border so borderless games compare equal to
+    // the monitor rectangle.
+    let mut measured = unsafe {
+        DwmGetWindowAttribute(
+            foreground,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut std::ffi::c_void,
+            size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok();
+    if !measured {
+        measured = unsafe { GetWindowRect(foreground, &mut rect) }.is_ok();
+    }
+    if !measured {
+        return false;
+    }
+    let area = info.rcMonitor;
+    rect.left <= area.left + 2
+        && rect.top <= area.top + 2
+        && rect.right >= area.right - 2
+        && rect.bottom >= area.bottom - 2
+}
+
 fn sync_shutdown_shortcuts(hwnd: HWND) {
     for index in 0..SHORTCUT_COUNT {
         unsafe {
@@ -3072,6 +3180,9 @@ fn sync_shutdown_shortcuts(hwnd: HWND) {
     }
 }
 
+/// Real Windows 11 Mica on the title bar (and a matching tint in the client,
+/// drawn by `paint::draw_gradient`). On older builds the call fails silently
+/// and the application gradient remains.
 fn sync_backdrop(state: &mut State, hwnd: HWND) {
     let dark = crate::theme::resolve_dark(state.app.core.settings.theme.mode);
     if state.backdrop == Some((crate::core::config::BackgroundMode::Solid, dark)) {
@@ -5106,6 +5217,11 @@ unsafe extern "system" fn window_proc(
             }
             // Focus changes start/stop animations when "pause when unfocused"
             // is enabled; the timer is restarted without repainting by itself.
+            if let Some(state) = unsafe { state_mut(hwnd) } {
+                // Short taps must survive sampling: poll faster while the
+                // player owns the foreground, and back off in the background.
+                sync_gamepad(state, hwnd);
+            }
             unsafe { sync_timer(hwnd) };
             LRESULT(0)
         }
@@ -5212,18 +5328,135 @@ unsafe extern "system" fn window_proc(
                 GAMEPAD_TIMER => {
                     let mut changed = false;
                     let mut connected = true;
+                    let mut focus_changed = false;
+                    let mut capture_finished = false;
                     if let Some(state) = unsafe { state_mut(hwnd) } {
-                        let actions = state.gamepad.poll();
+                        let tick = state.gamepad.poll();
                         connected = state.gamepad.is_connected();
-                        changed = !actions.is_empty();
-                        for action in actions {
-                            perform_gamepad_action(state, hwnd, action);
+                        if let Some(tick) = tick {
+                            if state.app.gamepad_capture_active() {
+                                // Accumulate until every button is released;
+                                // the longest chord held is the binding.
+                                state.app.update_gamepad_capture(hwnd, tick.down);
+                                if tick.released {
+                                    state.app.commit_gamepad_capture(hwnd);
+                                    capture_finished = true;
+                                    changed = true;
+                                }
+                            } else {
+                                let focused;
+                                let fired;
+                                {
+                                    let shortcuts = &state.app.core.settings.shortcuts;
+                                    focused = shortcuts.gamepad_ui
+                                        && ui_has_focus(hwnd)
+                                        && !text_input_has_focus();
+                                    let bindings = gamepad_bindings(shortcuts);
+                                    let masks: Vec<u32> =
+                                        bindings.iter().map(|(_, mask)| *mask).collect();
+                                    let mut fired_slots: Vec<GamepadSlot> = Vec::new();
+                                    // Probed lazily: a DWM query per 100 ms tick
+                                    // would be wasted when no single-button
+                                    // binding is pressed.
+                                    let mut fullscreen = None;
+                                    for index in crate::gamepad::triggered(
+                                        tick.previous,
+                                        tick.down,
+                                        &masks,
+                                    ) {
+                                        let mask = masks[index];
+                                        // While the focus ring is active its
+                                        // buttons belong to navigation, exactly
+                                        // like an in-window keyboard shortcut.
+                                        if focused && mask & UI_MASK != 0 {
+                                            continue;
+                                        }
+                                        if shortcuts.gamepad_fullscreen_only_chords
+                                            && !focused
+                                            && !crate::gamepad::is_chord(mask)
+                                            && *fullscreen
+                                                .get_or_insert_with(other_app_fullscreen)
+                                        {
+                                            // A game owns the monitor; a single
+                                            // button is gameplay, not a media key.
+                                            continue;
+                                        }
+                                        fired_slots.push(bindings[index].0);
+                                    }
+                                    fired = fired_slots;
+                                }
+                                if focused {
+                                    if tick.pressed & crate::gamepad::A != 0 {
+                                        // The first press only reveals the ring;
+                                        // the next one activates the control.
+                                        let before = state.app.keyboard_focus();
+                                        if before.is_none() {
+                                            state.app.reveal_gamepad_focus(hwnd);
+                                        } else {
+                                            state.app.on_key(hwnd, 0x0D, false, false);
+                                        }
+                                        focus_changed |= state.app.keyboard_focus() != before;
+                                        changed = true;
+                                    }
+                                    if tick.pressed & crate::gamepad::B != 0 {
+                                        let before = state.app.keyboard_focus();
+                                        state.app.on_key(hwnd, 0x1B, false, false);
+                                        focus_changed |= state.app.keyboard_focus() != before;
+                                        changed = true;
+                                    }
+                                    if tick.pressed & crate::gamepad::LB != 0 {
+                                        let before = state.app.keyboard_focus();
+                                        state.app.on_key(hwnd, 0x09, false, true);
+                                        focus_changed |= state.app.keyboard_focus() != before;
+                                        changed = true;
+                                    }
+                                    if tick.pressed & crate::gamepad::RB != 0 {
+                                        let before = state.app.keyboard_focus();
+                                        state.app.on_key(hwnd, 0x09, false, false);
+                                        focus_changed |= state.app.keyboard_focus() != before;
+                                        changed = true;
+                                    }
+                                    if tick.pressed & crate::gamepad::START != 0 {
+                                        state.app.toggle_play(hwnd);
+                                        changed = true;
+                                    }
+                                    if let Some(direction) = tick.direction {
+                                        let before = state.app.keyboard_focus();
+                                        state.app.on_key(hwnd, direction.key(), false, false);
+                                        focus_changed |= state.app.keyboard_focus() != before;
+                                        changed = true;
+                                    }
+                                }
+                                for slot in fired {
+                                    perform_gamepad_slot(state, hwnd, slot);
+                                    changed = true;
+                                }
+                            }
                         }
                     }
                     if !connected {
                         let _ = unsafe { KillTimer(Some(hwnd), GAMEPAD_TIMER) };
                         if let Some(state) = unsafe { state_mut(hwnd) } {
                             state.gamepad_running = false;
+                            state.gamepad_interval = 0;
+                        }
+                    }
+                    if capture_finished {
+                        if let Some(state) = unsafe { state_mut(hwnd) } {
+                            // Capture unregistered the global hotkeys; put them
+                            // back even when no animation timer is running.
+                            sync_shortcuts(state, hwnd);
+                            sync_gamepad(state, hwnd);
+                        }
+                    }
+                    if focus_changed {
+                        // Announce the ring move for screen readers; the UIA
+                        // tree borrows the window state, so do it after the
+                        // `State` borrow above ended.
+                        let target = unsafe { state_mut(hwnd) }
+                            .and_then(|state| state.app.keyboard_focus());
+                        if let Some(target) = target {
+                            crate::accessibility::notify_focus(hwnd, target);
                         }
                     }
                     if changed {
@@ -5841,7 +6074,13 @@ unsafe extern "system" fn window_proc(
             if let Some(state) = unsafe { state_mut(hwnd) } {
                 state.last_input = Instant::now();
                 let key = wparam.0 as u16;
-                if state.app.shortcut_capture_active() {
+                if state.app.gamepad_capture_active() {
+                    // Waiting for a controller chord; only Esc cancels and
+                    // clears the binding.
+                    if key == VK_ESCAPE.0 {
+                        state.app.cancel_gamepad_capture(hwnd);
+                    }
+                } else if state.app.shortcut_capture_active() {
                     // The settings row owns the keyboard until a complete
                     // combination arrives (modifier-only presses are ignored).
                     if key == VK_ESCAPE.0 {
@@ -5860,7 +6099,10 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                     sync_shortcuts(state, hwnd);
-                } else {
+                } else if ui_has_focus(hwnd) && !text_input_has_focus() {
+                    // In-window shortcuts are accessibility shortcuts: they
+                    // only run while this player owns the foreground and never
+                    // while a native text editor is typing.
                     let focus_before = state.app.keyboard_focus();
                     let ctrl = unsafe { GetKeyState(0x11) } < 0; // VK_CONTROL
                     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;

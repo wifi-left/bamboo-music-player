@@ -110,11 +110,20 @@ Windows 原生音乐播放器。主窗口使用 Win32 + GDI 自绘，Direct2D �
 - 全局快捷键可自定义（默认 Ctrl+Alt+P 播放暂停、Ctrl+Alt+←/→ 切歌、
   Ctrl+Alt+M 桌面歌词、Ctrl+Alt+Q 显示/隐藏），带格式校验、重复绑定检测
   和系统占用提示；Esc 可清空某个动作（允许不绑定），托盘菜单同步显示当前
-  组合，手柄可单独关闭。
+  组合。
+- 手柄快捷键同样可在“快捷键”页自定义，支持组合键（如 `LB+RB`、`Start+A`）。
+  默认沿用 A/B/X/Y/Start/D-Pad 单键映射；其他程序全屏（游戏）时单键绑定
+  自动忽略，组合键仍然生效，避免边玩边误触。手柄关闭后立即停止轮询。
+- 手柄界面操作（默认开启，仅在本播放器为前台窗口时生效）：D-Pad/左摇杆
+  移动或滚动列表，A 显示焦点后再次按下激活，B 返回，LB/RB 前后切换焦点，
+  Start 播放/暂停；焦点变化通过 UI Automation 播报。
+- 键盘界面快捷键只在本窗口拥有前台焦点时处理，且原生输入框聚焦时不会触发：
+  Tab/Shift+Tab 移动焦点环，Enter/Space 激活，←/→ 调整进度，↑/↓/PageUp/
+  PageDown/Home/End 滚动列表，Ctrl+←/→ 切歌，Ctrl+↑/↓ 调音量。
 - Tab 焦点环覆盖侧栏、播放条、页面工具栏、设置行和可见列表行；
   Enter/Space 激活，音量/进度支持方向键与 Home/End；主窗口、独立歌词、
   桌面歌词、迷你播放器都有 UI Automation 片段树。
-- `cargo test`：263 passed / 0 failed / 6 ignored。
+- `cargo test`：271 passed / 0 failed / 6 ignored。
 - `--self-test` 验证窗口与绘制；`--bench [秒]` 输出 tick/帧数、绘制耗时与私有内存。
 - 测试辅助：`--page <now_playing|queue|library|folders|search|discover|smart|duplicates|stats|downloads|settings>`、
   `--sort <title|artist|album|added|duration|plays|played|path>`、

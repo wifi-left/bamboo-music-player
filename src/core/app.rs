@@ -326,7 +326,12 @@ pub enum Command {
     /// Global hotkeys: enable, rebind one slot, or restore defaults.
     SetShortcutsEnabled(bool),
     SetGamepadEnabled(bool),
+    /// Gamepad focus-ring navigation while the player owns the foreground.
+    SetGamepadUiEnabled(bool),
+    /// Only multi-button chords fire while another app is fullscreen.
+    SetGamepadFullscreenOnlyChords(bool),
     SetShortcut(crate::config::ShortcutSlot, String),
+    SetGamepadShortcut(crate::config::GamepadSlot, String),
     ResetShortcuts,
     SetTrimWorkingSetOnIdle(bool),
     SetTrimIdleSecs(u64),
@@ -1811,10 +1816,24 @@ impl AppCore {
                 self.settings.shortcuts.gamepad = on;
                 self.settings_dirty = true;
             }
+            Command::SetGamepadUiEnabled(on) => {
+                self.settings.shortcuts.gamepad_ui = on;
+                self.settings_dirty = true;
+            }
+            Command::SetGamepadFullscreenOnlyChords(on) => {
+                self.settings.shortcuts.gamepad_fullscreen_only_chords = on;
+                self.settings_dirty = true;
+            }
             Command::SetShortcut(slot, combo) => {
                 // Empty is a valid binding: the action simply has no global
                 // hotkey. Esc during capture writes an empty string.
                 self.settings.shortcuts.set(slot, combo.trim().to_string());
+                self.settings_dirty = true;
+            }
+            Command::SetGamepadShortcut(slot, combo) => {
+                self.settings
+                    .shortcuts
+                    .gamepad_set(slot, combo.trim().to_string());
                 self.settings_dirty = true;
             }
             Command::ResetShortcuts => {

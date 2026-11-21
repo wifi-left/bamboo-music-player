@@ -3352,3 +3352,58 @@ ref/archived/bamboo-egui/       0.1.0 egui 版历史交接与实现参考
   这会移除自定义颜色、歌词/overlay 样式和目录设置。”
 - 只有点“是”才执行 `AppCore::reset_settings()`、重新应用设置并 toast
   “设置已恢复默认”；点“否”直接返回，不改任何配置。
+
+## 31. 输入分层：全局手柄组合 / 手柄界面 / 键盘界面（2026-11-21）
+
+### 31.1 全局手柄快捷键可组合、可自定义
+
+- `ShortcutSettings` 新增 9 个 `gamepad_*` 组合字符串（`A`、`LB+RB` 这类
+  `+` 连接），与原有 11 个键盘热键并列显示在“快捷键”页；`GamepadSlot`
+  提供 `ALL/get/set`，默认值保持历史单键映射：
+  A 播放/暂停、B 下一首、X 上一首、Y 桌面歌词、Start 显示/隐藏、
+  D-Pad ↑/↓ 音量、←/→ 快退/快进。
+- `src/gamepad.rs` 重写为状态采样：`parse/format` 负责组合键文本（大小写、
+  顺序无关，别名 `L1/R1/L2/R2/LS/RS/dpad-up` 可读），`Poll` 暴露
+  `previous/down/pressed/released/direction`。组合在“所有键按住且至少一个新
+  按下”时触发；同一 tick 内单键与组合同时成立时，长组合优先，避免默认单键
+  与自定义组合重复执行。
+- 左摇杆与 D-Pad 共用方向自动重复（首次 380ms，之后 110ms），供界面导航。
+- 绑定捕获：点击手柄行后进入捕获模式，按住期间实时预览组合文本，全部松开
+  才提交；Esc 清空绑定。捕获期间停止全局键盘热键注册，避免旧热键被触发。
+
+### 31.2 避免和游戏冲突
+
+- 新增 `gamepad_fullscreen_only_chords`（默认开）：前台窗口属于其他进程且
+  覆盖整个显示器（`GetForegroundWindow` + `DwmGetWindowAttribute`
+  `DWMWA_EXTENDED_FRAME_BOUNDS` / `GetWindowRect` 对比 `MONITORINFO.rcMonitor`）
+  时，只响应多键组合，单键绑定忽略。DWM 查询按需触发：仅当确实有单键绑定
+  命中时才探测，避免 100ms 轮询里的无谓系统调用。
+- 组合键（`LB+Start`、`LT+RT` 等）在全屏游戏里仍可用于控制播放器；单键让位
+  给游戏本身。
+
+### 31.3 手柄界面操作（仅窗口聚焦）
+
+- 新增 `gamepad_ui`（默认开）：`GetForegroundWindow` 属于本进程（主窗口或
+  独立歌词窗口）时，手柄按键走界面导航并复用 `on_key`：
+  D-Pad/左摇杆 = 方向键（滚动/移动焦点），A = 首次显示焦点环（落在播放键或
+  设置页第一行，`App::reveal_gamepad_focus`）、再次按下激活，
+  B = Esc（关闭浮层/退出大歌词），LB/RB = Shift+Tab/Tab 切换焦点，
+  Start = 播放/暂停。焦点变化通过 `accessibility::notify_focus` 上报 UIA。
+- 聚焦时 A/B/LB/RB/Start/D-Pad 属于界面（`gamepad::UI_MASK`），包含这些键的
+  全局组合被遮蔽；X/Y/Back/LS/RS/LT/RT 等未占用按键的全局绑定仍然生效。
+
+### 31.4 键盘界面快捷键的显式门控
+
+- `WM_KEYDOWN` 的普通分支新增两道检查：`ui_has_focus()`（前台是本进程或本线程
+  持有焦点）与 `text_input_has_focus()`（焦点类名为 `Edit`）。内置 ←/→ 调
+  进度、↑/↓ 滚动等只在本播放器拥有界面焦点、且没有原生输入框正在编辑时执行。
+- 键盘/手柄捕获互斥：点击任一行会把另一种捕获清空；切换设置分类或离开设置页
+  也会丢弃未提交的捕获，不会把全局热键留在未注册状态。
+
+### 31.5 测试与验证
+
+- `gamepad`：组合解析/格式化、别名、非法文本、单键与组合仲裁、方向键映射、
+  XInput ABI 布局、缺少 DLL。
+- `shortcuts`：新增 `default_gamepad_bindings_cover_every_slot`，保证 9 个默认
+  绑定都可解析。
+- `cargo test`：271 passed / 6 ignored；`cargo run -- --self-test` 通过。

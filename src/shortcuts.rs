@@ -210,6 +210,26 @@ mod tests {
         assert_eq!(settings.fill_lyric, "Ctrl+Alt+Shift+L");
         assert_eq!(settings.fill_title, "Ctrl+Alt+Shift+T");
         assert!(settings.gamepad);
+        assert!(settings.gamepad_ui);
+        assert!(settings.gamepad_fullscreen_only_chords);
+    }
+
+    #[test]
+    fn default_gamepad_bindings_cover_every_slot() {
+        let settings = crate::config::ShortcutSettings::default();
+        for slot in crate::config::GamepadSlot::ALL {
+            let text = settings.gamepad_get(slot);
+            assert!(
+                crate::gamepad::parse(text).is_some(),
+                "default binding for {:?} must parse: {text}",
+                slot
+            );
+        }
+        assert_eq!(settings.gamepad_get(crate::config::GamepadSlot::PlayPause), "A");
+        assert_eq!(
+            settings.gamepad_get(crate::config::GamepadSlot::ShowHide),
+            "Start"
+        );
     }
 
     #[test]

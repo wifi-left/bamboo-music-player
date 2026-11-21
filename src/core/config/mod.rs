@@ -1303,6 +1303,24 @@ pub struct ShortcutSettings {
     pub enabled: bool,
     /// Map XInput button presses to playback commands.
     pub gamepad: bool,
+    /// Gamepad buttons drive the focus ring while this process owns the
+    /// foreground window. Global gamepad combos are shadowed by the buttons
+    /// this mode consumes.
+    pub gamepad_ui: bool,
+    /// While another application is fullscreen (a game), only multi-button
+    /// gamepad chords fire so single-button bindings cannot leak into gameplay.
+    pub gamepad_fullscreen_only_chords: bool,
+    /// Global gamepad shortcuts. Chords are joined with `+` (`LB+RB`,
+    /// `LB+Start`); an empty string disables the action.
+    pub gamepad_play_pause: String,
+    pub gamepad_next: String,
+    pub gamepad_prev: String,
+    pub gamepad_volume_up: String,
+    pub gamepad_volume_down: String,
+    pub gamepad_seek_back: String,
+    pub gamepad_seek_forward: String,
+    pub gamepad_toggle_desktop_lyrics: String,
+    pub gamepad_show_hide: String,
 }
 
 /// One configurable global hotkey. Kept in the config module so the core and
@@ -1350,6 +1368,79 @@ impl ShortcutSlot {
             ShortcutSlot::CopyTitle => "复制歌名",
             ShortcutSlot::FillLyric => "填充歌词到鼠标窗口",
             ShortcutSlot::FillTitle => "填充歌名到鼠标窗口",
+        }
+    }
+}
+
+/// One configurable global gamepad shortcut. Values are XInput button chords
+/// (`LB+RB`, `LB+Start`); the gamepad module owns parsing and canonical text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GamepadSlot {
+    PlayPause,
+    Next,
+    Prev,
+    VolumeUp,
+    VolumeDown,
+    SeekBack,
+    SeekForward,
+    ToggleDesktopLyrics,
+    ShowHide,
+}
+
+impl GamepadSlot {
+    pub const ALL: [GamepadSlot; 9] = [
+        GamepadSlot::PlayPause,
+        GamepadSlot::Next,
+        GamepadSlot::Prev,
+        GamepadSlot::VolumeUp,
+        GamepadSlot::VolumeDown,
+        GamepadSlot::SeekBack,
+        GamepadSlot::SeekForward,
+        GamepadSlot::ToggleDesktopLyrics,
+        GamepadSlot::ShowHide,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GamepadSlot::PlayPause => "手柄：播放 / 暂停",
+            GamepadSlot::Next => "手柄：下一首",
+            GamepadSlot::Prev => "手柄：上一首",
+            GamepadSlot::VolumeUp => "手柄：音量 +5%",
+            GamepadSlot::VolumeDown => "手柄：音量 -5%",
+            GamepadSlot::SeekBack => "手柄：快退",
+            GamepadSlot::SeekForward => "手柄：快进",
+            GamepadSlot::ToggleDesktopLyrics => "手柄：桌面歌词",
+            GamepadSlot::ShowHide => "手柄：显示 / 隐藏窗口",
+        }
+    }
+}
+
+impl ShortcutSettings {
+    pub fn gamepad_get(&self, slot: GamepadSlot) -> &str {
+        match slot {
+            GamepadSlot::PlayPause => &self.gamepad_play_pause,
+            GamepadSlot::Next => &self.gamepad_next,
+            GamepadSlot::Prev => &self.gamepad_prev,
+            GamepadSlot::VolumeUp => &self.gamepad_volume_up,
+            GamepadSlot::VolumeDown => &self.gamepad_volume_down,
+            GamepadSlot::SeekBack => &self.gamepad_seek_back,
+            GamepadSlot::SeekForward => &self.gamepad_seek_forward,
+            GamepadSlot::ToggleDesktopLyrics => &self.gamepad_toggle_desktop_lyrics,
+            GamepadSlot::ShowHide => &self.gamepad_show_hide,
+        }
+    }
+
+    pub fn gamepad_set(&mut self, slot: GamepadSlot, value: String) {
+        match slot {
+            GamepadSlot::PlayPause => self.gamepad_play_pause = value,
+            GamepadSlot::Next => self.gamepad_next = value,
+            GamepadSlot::Prev => self.gamepad_prev = value,
+            GamepadSlot::VolumeUp => self.gamepad_volume_up = value,
+            GamepadSlot::VolumeDown => self.gamepad_volume_down = value,
+            GamepadSlot::SeekBack => self.gamepad_seek_back = value,
+            GamepadSlot::SeekForward => self.gamepad_seek_forward = value,
+            GamepadSlot::ToggleDesktopLyrics => self.gamepad_toggle_desktop_lyrics = value,
+            GamepadSlot::ShowHide => self.gamepad_show_hide = value,
         }
     }
 }
@@ -1405,7 +1496,21 @@ impl Default for ShortcutSettings {
             fill_lyric: "Ctrl+Alt+Shift+L".to_string(),
             fill_title: "Ctrl+Alt+Shift+T".to_string(),
             enabled: true,
+            // The XInput defaults keep the historical single-button mapping.
+            // While a game owns the fullscreen foreground window those single
+            // buttons are ignored; users who want in-game control bind chords.
             gamepad: true,
+            gamepad_ui: true,
+            gamepad_fullscreen_only_chords: true,
+            gamepad_play_pause: "A".to_string(),
+            gamepad_next: "B".to_string(),
+            gamepad_prev: "X".to_string(),
+            gamepad_volume_up: "Up".to_string(),
+            gamepad_volume_down: "Down".to_string(),
+            gamepad_seek_back: "Left".to_string(),
+            gamepad_seek_forward: "Right".to_string(),
+            gamepad_toggle_desktop_lyrics: "Y".to_string(),
+            gamepad_show_hide: "Start".to_string(),
         }
     }
 }
@@ -2039,6 +2144,43 @@ mod tests {
         assert_eq!(restored.window.lyrics_monitor, Some(1));
         assert!(restored.visualizer.enabled);
         assert_eq!(restored.visualizer.mode, VisualizerMode::Bars);
+    }
+
+    #[test]
+    fn legacy_settings_gain_the_default_gamepad_bindings() {
+        let mut settings = Settings::default();
+        // Simulate a file written before the custom gamepad bindings existed.
+        let mut value = serde_json::to_value(&settings).expect("serialize settings");
+        let shortcuts = value
+            .get_mut("shortcuts")
+            .and_then(|value| value.as_object_mut())
+            .expect("shortcuts object");
+        for key in [
+            "gamepad_ui",
+            "gamepad_fullscreen_only_chords",
+            "gamepad_play_pause",
+            "gamepad_next",
+            "gamepad_prev",
+            "gamepad_volume_up",
+            "gamepad_volume_down",
+            "gamepad_seek_back",
+            "gamepad_seek_forward",
+            "gamepad_toggle_desktop_lyrics",
+            "gamepad_show_hide",
+        ] {
+            shortcuts.remove(key);
+        }
+        let restored: Settings =
+            serde_json::from_value(value).expect("legacy settings still load");
+        assert!(restored.shortcuts.gamepad_ui);
+        assert!(restored.shortcuts.gamepad_fullscreen_only_chords);
+        assert_eq!(restored.shortcuts.gamepad_play_pause, "A");
+        assert_eq!(restored.shortcuts.gamepad_show_hide, "Start");
+
+        settings.shortcuts.gamepad_play_pause = "LB+RB".to_string();
+        let text = serde_json::to_string(&settings).expect("serialize settings");
+        let restored: Settings = serde_json::from_str(&text).expect("round trip");
+        assert_eq!(restored.shortcuts.gamepad_play_pause, "LB+RB");
     }
 
     #[test]

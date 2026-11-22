@@ -27,14 +27,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GWL_STYLE,
-    GetWindowLongPtrW, GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST,
     IDC_ARROW, IsIconic, IsWindowVisible, LoadCursorW, LoadIconW, MINMAXINFO, PostMessageW,
-    RegisterClassW, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SendMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSW, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOWPLACEMENT, WM_APP,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -67,7 +67,10 @@ struct WindowState {
     main: HWND,
     child: HWND,
     windowed: bool,
-    /// Normal placement restored when leaving fullscreen.
+    /// Windowed mode was maximized (native title-bar maximize), restored the
+    /// next time the window opens and after leaving F11 fullscreen.
+    maximized: bool,
+    /// Normal (restored) placement used when leaving fullscreen or un-maximizing.
     saved: RECT,
     screen: Screen,
 }
@@ -87,6 +90,7 @@ impl LyricsWindow {
         size: Option<(f32, f32)>,
         dpi: f32,
         windowed: bool,
+        maximized: bool,
     ) -> Result<Self> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -140,12 +144,19 @@ impl LyricsWindow {
                 main,
                 child: child.hwnd(),
                 windowed,
+                maximized: windowed && maximized,
                 saved,
                 screen: Screen::new()?,
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
             if !windowed {
                 enter_fullscreen(hwnd);
+                // `enter_fullscreen` reads the placement of a never-shown
+                // window (not maximized); keep the session's remembered
+                // maximize state for when the user leaves fullscreen.
+                if let Some(state) = window_state_mut(hwnd) {
+                    state.maximized = maximized;
+                }
             }
             Ok(Self { hwnd, child })
         }
@@ -164,6 +175,12 @@ impl LyricsWindow {
             .unwrap_or(true)
     }
 
+    /// Whether the windowed frame is maximized. While F11 fullscreen is active
+    /// the flag is kept for the window the user returns to.
+    pub fn is_maximized(&self) -> bool {
+        window_state(self.hwnd).is_some_and(|state| state.maximized)
+    }
+
     /// Push the current snapshot into the shell and the lyric child.
     pub fn sync(&mut self, app: &App) {
         let Some(state) = window_state_mut(self.hwnd) else {
@@ -179,8 +196,17 @@ impl LyricsWindow {
     /// Show the window and do a first sync.
     pub fn show(&mut self, app: &App) {
         self.sync(app);
+        let maximized = window_state(self.hwnd)
+            .is_some_and(|state| state.windowed && state.maximized);
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = ShowWindow(
+                self.hwnd,
+                if maximized {
+                    SW_SHOWMAXIMIZED
+                } else {
+                    SW_SHOW
+                },
+            );
             let _ = SetForegroundWindow(self.hwnd);
         }
         self.sync(app);
@@ -209,6 +235,18 @@ impl LyricsWindow {
         let mut current = RECT::default();
         let rect = match window_state(self.hwnd) {
             Some(state) if !state.windowed => state.saved,
+            Some(state) if state.maximized => {
+                // While maximized `GetWindowRect` reports the maximized frame;
+                // the normal position is what restore-down should return to.
+                let mut placement = WINDOWPLACEMENT {
+                    length: size_of::<WINDOWPLACEMENT>() as u32,
+                    ..Default::default()
+                };
+                if unsafe { GetWindowPlacement(self.hwnd, &mut placement) }.is_err() {
+                    return (None, None);
+                }
+                placement.rcNormalPosition
+            }
             _ => {
                 if unsafe { GetWindowRect(self.hwnd, &mut current) }.is_err() {
                     return (None, None);
@@ -249,11 +287,18 @@ fn window_state_mut(hwnd: HWND) -> Option<&'static mut WindowState> {
 /// Borderless fullscreen on the monitor that currently contains the window.
 fn enter_fullscreen(hwnd: HWND) {
     unsafe {
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok()
+        // Remember the windowed frame. `rcNormalPosition` is the pre-maximize
+        // rectangle, so leaving fullscreen can restore the maximized state and
+        // still un-maximize to the right size.
+        let mut placement = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement).is_ok()
             && let Some(state) = window_state_mut(hwnd)
         {
-            state.saved = rect;
+            state.saved = placement.rcNormalPosition;
+            state.maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32;
         }
         SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -284,6 +329,7 @@ fn exit_fullscreen(hwnd: HWND) {
         let saved = window_state(hwnd)
             .map(|state| state.saved)
             .unwrap_or_default();
+        let maximized = window_state(hwnd).is_some_and(|state| state.maximized);
         SetWindowLongPtrW(
             hwnd,
             GWL_STYLE,
@@ -300,6 +346,9 @@ fn exit_fullscreen(hwnd: HWND) {
         );
         if let Some(state) = window_state_mut(hwnd) {
             state.windowed = true;
+        }
+        if maximized {
+            let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
         }
     }
 }

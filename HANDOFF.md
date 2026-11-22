@@ -3407,3 +3407,102 @@ ref/archived/bamboo-egui/       0.1.0 egui 版历史交接与实现参考
 - `shortcuts`：新增 `default_gamepad_bindings_cover_every_slot`，保证 9 个默认
   绑定都可解析。
 - `cargo test`：271 passed / 6 ignored；`cargo run -- --self-test` 通过。
+
+## 32. 索引 / 歌词窗口最大化 / 桌面歌词顺序 / 手柄无障碍输入（2026-11-22）
+
+### 32.1 队列页与正在播放页显示当前索引
+
+- `App::current_position_label()` 由 `snapshot.current_index` 和队列长度生成
+  “第 12 / 245 首”；`with_position_label()` 把它拼在页面副标题前。
+- 队列页：无筛选时为“第 12 / 245 首 · 245 首歌曲（· 乱序播放）”，筛选时为
+  “第 12 / 245 首 · 8 / 245 首 · 筛选：…”。正在播放页副标题同样带索引。
+- `invalidate_track_change` 对这两个页面额外失效 `layout.header`，切歌时副标题
+  立即刷新。
+
+### 32.2 独立歌词窗口记住最大化
+
+- `Session.lyrics_window_maximized`（`serde(default)`）保存原生最大化状态；
+  `remember_lyrics_window()` 增加 `maximized` 参数。
+- `LyricsWindow::new(..., maximized)`：窗口仍以“还原尺寸”创建，`show()` 时用
+  `SW_SHOWMAXIMIZED`，避免隐藏创建阶段提前显示。
+- 最大化时 `geometry()` 用 `GetWindowPlacement().rcNormalPosition` 保存还原尺寸，
+  下次最大化打开再还原时不会得到整屏大小的普通窗口。
+- F11 全屏进入前用 `WINDOWPLACEMENT` 记住普通矩形与最大化标志，退出全屏后
+  先恢复普通矩形再 `SW_SHOWMAXIMIZED`；退出时正处于全屏也能保留该标志。
+
+### 32.3 桌面歌词标题/歌手顺序
+
+- `DesktopInfoOrder`（`title_artist` 默认 / `artist_title`）新增到
+  `DesktopLyricsSettings.info_order`，设置 → 桌面歌词新增“标题/歌手顺序”选项。
+- `OverlaySettings.info_order` 传到覆盖层线程；`render.rs` 的 footer 按选项
+  组合“歌名 - 歌手”或“歌手 - 歌名”。`DesktopSettingsKey` 同步该字段，切换后
+  即使暂停也会立刻推送完整状态。
+
+### 32.4 手柄/键盘无障碍导航与输入框
+
+- 方向键（键盘与手柄摇杆/D-Pad）在焦点环存在时移动无障碍焦点；播放条音量
+  与进度保留旧的调整/快进行为，列表行与设置行保留上下移动；无焦点环时保持
+  ←/→ 快进、↑/↓ 滚动。Space/Enter/手柄 A 确认。
+- `Target::Input(Input)` 把搜索框、队列筛选、文件夹地址栏、扩展名输入框加入
+  焦点环（按页面取 `layout` 矩形）；UIA 暴露为 Edit 且保留 Invoke。
+- 手柄 A 激活输入框时用静态 `GAMEPAD_KEYBOARD_PENDING` 标记，下一次原生
+  `EDIT` 获得焦点（`EN_SETFOCUS`）时打开 **Windows 手柄键盘**：
+  `CoreInputView::GetForCurrentView().TryShowWithKind(Gamepad)`（Win11 24H2+
+  官方手柄布局）。取不到 view 时依次回退 `ITipInvocation::Toggle`
+  （`CLSID_UIHostNoLaunch`）与 `TabTip.exe` / `osk.exe`。
+- EDIT 聚焦期间手柄输入交给系统键盘（同一批按键不能同时触发播放器动作）；
+  A 在键盘被关掉后重新 `TryShowWithKind(Gamepad)`（用
+  `GetCoreInputViewOcclusions()` 判断是否已打开，避免重复 show），B 通过
+  `leave_input` 关闭键盘并 `SetFocus` 回主窗口；Esc 走 `WM_APP_INPUT_ESCAPE`
+  做同样的事。`Cargo.toml` 打开 `UI_ViewManagement_Core` feature。
+- 实测（`examples/kbprobe`）：`GetForCurrentView OK`、
+  `TryShowWithKind(Gamepad)=true`、`TryHide=true`。
+- “手柄全局快捷键”（`shortcuts.gamepad`）与“手柄无障碍导航”
+  （`shortcuts.gamepad_ui`）彻底分开：轮询在任一开启时运行，全局组合仅在
+  前者开启时匹配；无障碍导航仅在后者开启时处理。
+- `reveal_gamepad_focus` 无焦点环时落在当前页第一可见行（列表页）、设置第一行
+  或播放键；随后方向键按 `focus_targets` 顺序移动。
+
+### 32.5 测试与验证
+
+- 新增 `desktop_info_order_defaults_to_title_first_and_round_trips`（旧配置默认
+  保持原顺序）。
+- `cargo test`：273 passed / 6 ignored；`--self-test` 分别通过 queue、
+  now_playing、settings(桌面歌词) 页面绘制。
+
+### 32.6 播放条滑杆编辑模式（2026-11-22）
+
+- 问题：焦点落到音量/进度后方向键被滑杆吞掉，手柄/键盘无法把焦点移走。
+- `App::adjusting: Option<Target>`：焦点在 `Volume`/`Progress` 时按
+  Enter/Space（手柄 A）进入编辑；只有编辑状态下方向键才调音量/快进
+  （进度条 ↑/↓ 被消费但不动作），B/Esc/Backspace 退出；未编辑时方向键正常
+  在焦点环中移动。Home/End 只在编辑状态生效。
+- 鼠标拖动、点击滑杆的值不变；任何鼠标按下、切换页面/设置分类、移动焦点都会
+  结束编辑状态。
+- `paint::edit_frame` 在焦点矩形上画实线 accent 边框表示“编辑中”；
+  `control_name` 对编辑中的滑杆追加“（编辑中）”，键入手柄时重新触发 UIA
+  焦点播报。
+
+### 32.7 焦点顺序与设置页手柄翻页（2026-11-22）
+
+- `focus_targets()` 改为按视觉布局返回：侧栏（索引顺序）→ 页面内容（按
+  `target_rect` 先 top 后 left 排序）→ 播放条（同样排序）。修复了以前
+  “侧栏 → 播放条 → 页面控件”的跳序。
+- `reveal_gamepad_focus` 只在 `page_shows_rows()` 的页面（队列/曲库/文件夹/
+  搜索/发现/智能/重复/下载）聚焦第一个可见行；此前“正在播放”页有队列数据
+  但无列表，会聚焦不可见的 `Row(0)`，留下截图中的虚焦点框。
+- 设置页聚焦时手柄 LT/RT 按 `SettingsTab::ALL` 循环切换分类；键盘
+  PageUp/PageDown 走同一逻辑（`on_key` 顶部，先于页面滚动）。包含 LT/RT 的
+  全局组合在该页被遮蔽，避免同一次按键触发两个动作。
+- 从侧栏焦点切换页面时保留 `Nav(index)` 焦点（`on_click` 的 nav 分支），
+  否则下一次方向输入会通过 `reveal_gamepad_focus` 落到播放条上。
+- `focus_layout_order` 用控件垂直中心而不是 top 排序：播放键比相邻按钮高
+  6 DIP，按 top 排序会让播放键排在随机/上一首之前，播放条按钮不再严格
+  从左到右。
+- 设置→曲库标签页补充焦点目标：三个开关（`SettingToggle`）、三个查重方式
+  分段（`SettingDedupeOption`）、添加目录、可见目录行的“移除”（`FolderRemove`）
+  和扩展名输入框；UIA 名称分别给出“标签：值 / 查重方式：x / 添加音乐目录 /
+  移除目录：<名字>”。目录行目标数量按“实际目录数 - 滚动偏移”限制，且
+  `focus_target_visible` 再校验一次，避免在空槽位画出幽灵焦点框。
+- `SettingsRow` 的上下键在首/尾越界时调用 `move_focus`，焦点接着移到相邻设置
+  分类标签或播放条，而不是停在设置页无法继续。

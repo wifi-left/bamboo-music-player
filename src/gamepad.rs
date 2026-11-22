@@ -418,8 +418,8 @@ fn stick_direction(sample: &Sample) -> Option<PadDir> {
     if x.abs() > y.abs() {
         Some(if x > 0.0 { PadDir::Right } else { PadDir::Left })
     } else {
-        // XInput's Y axis points down.
-        Some(if y > 0.0 { PadDir::Down } else { PadDir::Up })
+        // XInput's left-stick Y axis is positive when pushed up.
+        Some(if y > 0.0 { PadDir::Up } else { PadDir::Down })
     }
 }
 
@@ -528,5 +528,23 @@ mod tests {
         assert_eq!(PadDir::Down.key(), 0x28);
         assert_eq!(PadDir::Left.key(), 0x25);
         assert_eq!(PadDir::Right.key(), 0x27);
+    }
+
+    #[test]
+    fn stick_axis_direction_matches_xinput() {
+        // XInput reports a pushed-up stick as a positive sThumbLY; getting
+        // this backwards made the focus ring move opposite to the stick.
+        let sample = |lx: i16, ly: i16| Sample {
+            buttons: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            thumb_lx: lx,
+            thumb_ly: ly,
+        };
+        assert_eq!(stick_direction(&sample(0, i16::MAX)), Some(PadDir::Up));
+        assert_eq!(stick_direction(&sample(0, i16::MIN)), Some(PadDir::Down));
+        assert_eq!(stick_direction(&sample(i16::MAX, 0)), Some(PadDir::Right));
+        assert_eq!(stick_direction(&sample(i16::MIN, 0)), Some(PadDir::Left));
+        assert_eq!(stick_direction(&sample(0, 0)), None);
     }
 }

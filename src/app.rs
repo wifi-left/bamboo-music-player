@@ -353,6 +353,8 @@ pub enum SettingField {
     DesktopLines,
     DesktopTranslation,
     DesktopFooter,
+    /// Footer placement of the title/artist pair.
+    DesktopInfoOrder,
     DesktopFontSize,
     DesktopNextFontSize,
     DesktopPrevFontSize,
@@ -709,7 +711,7 @@ const LARGE_FIELDS: [SettingField; 24] = [
     SettingField::LargeTranslationColor,
 ];
 
-const DESKTOP_FIELDS: [SettingField; 64] = [
+const DESKTOP_FIELDS: [SettingField; 65] = [
     SettingField::DesktopShow,
     SettingField::DesktopLock,
     SettingField::DesktopClickThrough,
@@ -717,6 +719,7 @@ const DESKTOP_FIELDS: [SettingField; 64] = [
     SettingField::DesktopLines,
     SettingField::DesktopTranslation,
     SettingField::DesktopFooter,
+    SettingField::DesktopInfoOrder,
     SettingField::DesktopFontSize,
     SettingField::DesktopNextFontSize,
     SettingField::DesktopPrevFontSize,
@@ -860,6 +863,7 @@ const ALIGN_OPTIONS: [&str; 3] = ["左", "中", "右"];
 const DENSITY_OPTIONS: [&str; 3] = ["紧凑", "舒适", "宽松"];
 const MINI_LINE_OPTIONS: [&str; 2] = ["1 行", "2 行"];
 const DESKTOP_LINE_OPTIONS: [&str; 3] = ["1 行", "2 行", "3 行"];
+const DESKTOP_INFO_ORDER_OPTIONS: [&str; 2] = ["歌名 - 歌手", "歌手 - 歌名"];
 const DESKTOP_BG_OPTIONS: [&str; 5] = ["透明", "纯色", "渐变", "图片", "模糊"];
 const PROXY_OPTIONS: [&str; 3] = ["系统", "直连", "手动"];
 const CONFLICT_OPTIONS: [&str; 3] = ["重命名", "跳过", "覆盖"];
@@ -992,6 +996,10 @@ pub struct App {    pub dpi: f32,
     gamepad_capture_mask: u32,
     /// Keyboard focus ring target (`Tab` navigation).
     keyboard_focus: Option<Target>,
+    /// Player-bar slider that was entered with Enter/A. Arrows adjust it;
+    /// B/Esc/Backspace leaves. Without this the status bar captured direction
+    /// keys and the focus ring could not move past it.
+    adjusting: Option<Target>,
     /// Scroll offset of the sidebar navigation when the window is short.
     sidebar_scroll: f32,
     dragging_sidebar_scrollbar: bool,
@@ -1059,6 +1067,9 @@ pub struct App {    pub dpi: f32,
     number_edit_request: Option<usize>,
     /// Text row clicked; the shell shows the inline EDIT after the borrow.
     text_edit_request: Option<usize>,
+    /// Always-visible input box activated from the focus ring; the shell moves
+    /// keyboard focus to the matching native EDIT.
+    input_focus_request: Option<Input>,
     /// Desktop-lyrics background image picker requested.
     desktop_bg_pick_requested: bool,
     /// Desktop-lyrics font family picker requested.
@@ -1172,6 +1183,7 @@ impl App {
             gamepad_capture: None,
             gamepad_capture_mask: 0,
             keyboard_focus: None,
+            adjusting: None,
             sidebar_scroll: 0.0,
             dragging_sidebar_scrollbar: false,
             online_wall: false,
@@ -1211,6 +1223,7 @@ impl App {
             text_edit_row: None,
             number_edit_request: None,
             text_edit_request: None,
+            input_focus_request: None,
             desktop_bg_pick_requested: false,
             desktop_font_pick_requested: false,
             desktop_trans_font_pick_requested: false,
@@ -1516,6 +1529,25 @@ impl App {
         self.core.snapshot().queue.len()
     }
 
+    /// "第 12 / 245 首" for the queue entry that is playing, if any. The
+    /// position is the queue order (which is the shuffle order while shuffled),
+    /// so it always matches the highlighted row.
+    pub fn current_position_label(&self) -> Option<String> {
+        let snapshot = self.core.snapshot();
+        let index = snapshot.current_index?;
+        let total = snapshot.queue.len();
+        (total > 0).then(|| crate::trf!("第 {} / {} 首", index + 1, total))
+    }
+
+    /// Page subtitle prefixed with the playback position when one exists.
+    pub fn with_position_label(&self, detail: String) -> String {
+        match self.current_position_label() {
+            Some(label) if !detail.is_empty() => format!("{label} · {detail}"),
+            Some(label) => label,
+            None => detail,
+        }
+    }
+
     /// Rows in the list for the current page: filtered queue rows for most
     /// pages, the SQLite index for the library page, directory entries for
     /// the folder page.
@@ -1536,6 +1568,51 @@ impl App {
     /// Display row -> real queue index (filter may hide rows).
     pub fn queue_index(&self, display: usize) -> Option<usize> {
         self.queue_view.get(display).copied()
+    }
+
+    /// The always-visible native text input of the current page, if any. The
+    /// focus ring includes it so a controller-only user can reach the search
+    /// box, the queue filter, the folder address bar and the extensions field.
+    pub(crate) fn current_input_target(&self) -> Option<Input> {
+        match self.page {
+            Page::Library | Page::Search | Page::Queue => Some(Input::Search),
+            Page::Folders => Some(Input::FolderPath),
+            Page::Settings if self.settings_tab == SettingsTab::Library => {
+                Some(Input::Extensions)
+            }
+            _ => None,
+        }
+    }
+
+    fn input_rect(&self, input: Input) -> Option<Rect> {
+        match input {
+            Input::Search => Some(match self.page {
+                Page::Search => self.layout.online_search,
+                Page::Queue => self.layout.queue_filter,
+                _ => self.layout.search,
+            }),
+            Input::FolderPath => Some(self.layout.folder_address),
+            Input::Extensions => Some(layout::settings(&self.layout).ext_edit),
+            Input::SettingNumber => None,
+        }
+    }
+
+    /// Whether activating the target puts the user into text editing. Used to
+    /// open the touch keyboard for gamepad activation only (keyboard users can
+    /// type immediately after pressing Enter).
+    pub fn target_opens_text_input(&self, target: Target) -> bool {
+        match target {
+            Target::Input(_) => true,
+            Target::SettingsRow(index) => self
+                .settings_views()
+                .get(index)
+                .is_some_and(|view| matches!(view.kind, SettingKind::Text)),
+            _ => false,
+        }
+    }
+
+    pub fn take_input_focus_request(&mut self) -> Option<Input> {
+        self.input_focus_request.take()
     }
 
     /// Reveal the currently playing row in the queue viewport (when it is not
@@ -2062,6 +2139,9 @@ impl App {
         }
         self.settings_tab = tab;
         self.settings_scroll = 0.0;
+        // Row/input targets belong to the previous tab.
+        self.keyboard_focus = None;
+        self.adjusting = None;
         // The row that owned a capture is gone; drop the pending binding
         // instead of leaving the keyboard/gamepad in capture mode.
         self.shortcut_capture = None;
@@ -2281,10 +2361,10 @@ impl App {
                 toggle(crate::i18n::tr("全局快捷键"), settings.shortcuts.enabled)
             }
             SettingField::GamepadEnabled => {
-                toggle(crate::i18n::tr("手柄控制"), settings.shortcuts.gamepad)
+                toggle(crate::i18n::tr("手柄全局快捷键"), settings.shortcuts.gamepad)
             }
             SettingField::GamepadUiEnabled => toggle(
-                crate::i18n::tr("手柄界面操作（窗口聚焦时）"),
+                crate::i18n::tr("手柄无障碍导航（窗口聚焦时）"),
                 settings.shortcuts.gamepad_ui,
             ),
             SettingField::GamepadFullscreenOnlyChords => toggle(
@@ -3368,6 +3448,17 @@ impl App {
             },
             SettingField::DesktopTranslation => toggle("显示翻译", desktop.show_translation),
             SettingField::DesktopFooter => toggle("显示标题/歌手", desktop.show_footer),
+            SettingField::DesktopInfoOrder => SettingView {
+                label: "标题/歌手顺序",
+                kind: SettingKind::Choice,
+                value: String::new(),
+                active: desktop.show_footer,
+                options: &DESKTOP_INFO_ORDER_OPTIONS,
+                selected: Some(match desktop.info_order {
+                    crate::config::DesktopInfoOrder::TitleArtist => 0,
+                    crate::config::DesktopInfoOrder::ArtistTitle => 1,
+                }),
+            },
             SettingField::DesktopFontSize => SettingView {
                 label: "歌词字号",
                 kind: SettingKind::Step,
@@ -4341,6 +4432,12 @@ impl App {
             ),
             SettingField::DesktopFooter => Command::DesktopLyricsSetFooter(
                 !self.core.settings.desktop_lyrics.show_footer,
+            ),
+            SettingField::DesktopInfoOrder => Command::SetDesktopInfoOrder(
+                match option.unwrap_or(0) {
+                    1 => crate::config::DesktopInfoOrder::ArtistTitle,
+                    _ => crate::config::DesktopInfoOrder::TitleArtist,
+                },
             ),
             SettingField::DesktopFontSize => Command::DesktopLyricsSetFontSize(
                 self.core.settings.desktop_lyrics.font_size + delta as f32,
@@ -6090,8 +6187,11 @@ impl App {
                 self.invalidate(hwnd, self.layout.card_meta);
                 self.invalidate(hwnd, self.layout.card_badges);
                 self.invalidate(hwnd, self.layout.lyric_header);
+                // The page subtitle carries the queue position.
+                self.invalidate(hwnd, self.layout.header);
             }
             Page::Queue => {
+                self.invalidate(hwnd, self.layout.header);
                 let (first, last) = self.visible_rows();
                 for index in [old_index, new_index].into_iter().flatten() {
                     // Queue rows are rendered through the filter mapping.
@@ -6695,6 +6795,10 @@ impl App {
                 layout::action_reset_rect(control).inflate(2.0)
             }
             Target::SettingsScrollbar => layout::settings(&self.layout).scrollbar.inflate(2.0),
+            Target::Input(input) => self
+                .input_rect(input)
+                .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0))
+                .inflate(2.0),
             Target::FolderRemove(row) => {
                 let settings = layout::settings(&self.layout);
                 let row = layout::folder_row(&settings, row);
@@ -6818,6 +6922,11 @@ impl App {
     }
 
     pub fn on_press(&mut self, hwnd: HWND, x: f32, y: f32) {
+        if self.adjusting.take().is_some() {
+            if let Some(focus) = self.keyboard_focus {
+                self.invalidate(hwnd, self.target_rect(focus));
+            }
+        }
         if self.shortcut_capture.take().is_some() {
             // Any click leaves capture mode; the release handler may start it
             // again when the clicked row is another shortcut.
@@ -6869,6 +6978,10 @@ impl App {
         for (index, item) in self.layout.nav.iter().enumerate() {
             if item.contains(x, y) {
                 let page = Page::ALL[index];
+                // Keep the focus ring on the sidebar item when the page was
+                // switched from the focused nav row (keyboard/gamepad). Losing
+                // it made the next direction press reveal the player bar.
+                let keep_focus = self.keyboard_focus == Some(Target::Nav(index));
                 if page != self.page {
                     self.set_page(page);
                     self.invalidate_all(hwnd);
@@ -6878,6 +6991,9 @@ impl App {
                         // thin strip when coming from the library page.
                         self.invalidate_force(hwnd, self.layout.queue_filter.inflate(6.0));
                     }
+                }
+                if keep_focus {
+                    self.focus_target(hwnd, Target::Nav(index));
                 }
                 return;
             }
@@ -6889,6 +7005,17 @@ impl App {
                 self.set_page(Page::NowPlaying);
                 self.invalidate_all(hwnd);
             }
+            return;
+        }
+
+        // A synthetic click from the focus ring on an always-visible input box
+        // (real mouse clicks land on the child EDIT and never reach here).
+        if let Some(input) = self.current_input_target()
+            && self
+                .input_rect(input)
+                .is_some_and(|rect| rect.inflate(3.0).contains(x, y))
+        {
+            self.input_focus_request = Some(input);
             return;
         }
 
@@ -8429,9 +8556,13 @@ impl App {
     /// Controls reachable with Tab on the current page. Zero-sized controls
     /// (hidden sliders/buttons) are skipped so focus never lands on nothing.
     pub(crate) fn focus_targets(&self) -> Vec<Target> {
-        let mut out: Vec<Target> =
-            (0..self.layout.nav.len()).map(Target::Nav).collect();
-        out.extend([
+        // Reading order: the sidebar top-to-bottom, then the page content
+        // top-to-bottom/left-to-right, then the player bar at the bottom. The
+        // previous order jumped sidebar -> player bar -> page controls, which
+        // made Tab/arrow focus look arbitrary.
+        let mut nav: Vec<Target> = (0..self.layout.nav.len()).map(Target::Nav).collect();
+        let mut page: Vec<Target> = Vec::new();
+        let mut player = vec![
             Target::Shuffle,
             Target::Repeat,
             Target::Prev,
@@ -8444,9 +8575,12 @@ impl App {
             Target::Playlist,
             Target::MiniPlayer,
             Target::DesktopLyrics,
-        ]);
+        ];
+        if let Some(input) = self.current_input_target() {
+            page.push(Target::Input(input));
+        }
         match self.page {
-            Page::NowPlaying => out.extend([
+            Page::NowPlaying => page.extend([
                 Target::CardPlay,
                 Target::CardOpen,
                 Target::LyricsPick,
@@ -8455,8 +8589,10 @@ impl App {
                 Target::LyricsEdit,
                 Target::LyricsReload,
             ]),
-            Page::Queue => out.extend([Target::QueueImport, Target::QueueExport, Target::QueueClear]),
-            Page::Library => out.extend([
+            Page::Queue => {
+                page.extend([Target::QueueImport, Target::QueueExport, Target::QueueClear])
+            }
+            Page::Library => page.extend([
                 Target::Sort,
                 Target::AddFolder,
                 Target::Rescan,
@@ -8465,7 +8601,7 @@ impl App {
                 Target::LibraryPrev,
                 Target::LibraryNext,
             ]),
-            Page::Folders => out.extend([
+            Page::Folders => page.extend([
                 Target::FolderBack,
                 Target::FolderForward,
                 Target::FolderUp,
@@ -8473,7 +8609,7 @@ impl App {
                 Target::FolderPlayAll,
                 Target::FolderQueueAll,
             ]),
-            Page::Search => out.extend([
+            Page::Search => page.extend([
                 Target::OnlineKind,
                 Target::OnlineBack,
                 Target::OnlineQueueAll,
@@ -8482,9 +8618,9 @@ impl App {
                 Target::OnlinePrev,
                 Target::OnlineNext,
             ]),
-            Page::Discover => out.push(Target::DiscoverRefresh),
+            Page::Discover => page.push(Target::DiscoverRefresh),
             Page::Statistics => {
-                out.extend([Target::StatsRefresh, Target::StatsReset]);
+                page.extend([Target::StatsRefresh, Target::StatsReset]);
                 let recent = self
                     .core
                     .snapshot()
@@ -8494,44 +8630,82 @@ impl App {
                 let stats = layout::statistics(&self.layout);
                 let visible =
                     (stats.recent.height() / layout::STATS_ROW_HEIGHT).floor().max(0.0) as usize;
-                out.extend((0..recent.min(visible)).map(Target::StatsRecent));
+                page.extend((0..recent.min(visible)).map(Target::StatsRecent));
             }
-            Page::Downloads => out.extend([Target::DownloadsCleanPart, Target::DownloadsClearFinished]),
-            Page::Smart => out.extend([Target::SmartKind]),
-            Page::Duplicates => out.extend([Target::DuplicateMode]),
+            Page::Downloads => {
+                page.extend([Target::DownloadsCleanPart, Target::DownloadsClearFinished])
+            }
+            Page::Smart => page.extend([Target::SmartKind]),
+            Page::Duplicates => page.extend([Target::DuplicateMode]),
             // Focused settings rows would require inline editors; tabs are the
             // useful keyboard navigation target on this page.
             Page::Settings => {
-                out.extend((0..SettingsTab::ALL.len()).map(Target::SettingsTab));
-                if self.settings_tab != SettingsTab::Library {
-                    out.extend(
-                        (0..self.settings_tab.fields().len()).map(Target::SettingsRow),
+                page.extend((0..SettingsTab::ALL.len()).map(Target::SettingsTab));
+                if self.settings_tab == SettingsTab::Library {
+                    // The library tab is not made of generic rows: its switches,
+                    // dedupe segments, folder picker and per-folder remove
+                    // buttons need their own focus targets.
+                    page.extend([
+                        Target::SettingToggle(0),
+                        Target::SettingToggle(1),
+                        Target::SettingToggle(2),
+                    ]);
+                    page.extend((0..3).map(Target::SettingDedupeOption));
+                    page.push(Target::SettingAddFolder);
+                    // Folder rows scroll: seed only display rows that map to a
+                    // real folder. The area can hold many rows, but adding
+                    // empty-slot targets left a focus ring on a phantom
+                    // "remove" button below the last folder.
+                    let rows = self.settings_folder_rows().min(
+                        self.settings_folders()
+                            .len()
+                            .saturating_sub(self.settings_folders_scroll()),
                     );
+                    page.extend((0..rows).map(Target::FolderRemove));
+                } else {
+                    page.extend((0..self.settings_tab.fields().len()).map(Target::SettingsRow));
                 }
             }
         }
-        if matches!(
-            self.page,
-            Page::Queue
-                | Page::Library
-                | Page::Folders
-                | Page::Search
-                | Page::Discover
-                | Page::Smart
-                | Page::Duplicates
-                | Page::Downloads
-        ) {
+        if self.page_shows_rows() {
             let (first, last) = self.visible_rows();
-            out.extend((first..last).map(Target::Row));
+            page.extend((first..last).map(Target::Row));
         }
-        out.retain(|target| {
-            let rect = self.target_rect(*target);
-            rect.width() > 0.0
-                && rect.height() > 0.0
-                && (!matches!(*target, Target::Nav(_))
-                    || self.layout.nav_viewport.intersects(rect))
-        });
-        out
+        nav.retain(|target| self.focus_target_visible(*target));
+        page.retain(|target| self.focus_target_visible(*target));
+        player.retain(|target| self.focus_target_visible(*target));
+        page.sort_by(|left, right| self.focus_layout_order(*left, *right));
+        player.sort_by(|left, right| self.focus_layout_order(*left, *right));
+        nav.extend(page);
+        nav.extend(player);
+        nav
+    }
+
+    fn focus_target_visible(&self, target: Target) -> bool {
+        let rect = self.target_rect(target);
+        rect.width() > 0.0
+            && rect.height() > 0.0
+            && (!matches!(target, Target::Nav(_)) || self.layout.nav_viewport.intersects(rect))
+            && match target {
+                // A scrolled folder list can have fewer real rows than slots.
+                Target::FolderRemove(row) => {
+                    self.settings_folders_scroll() + row < self.settings_folders().len()
+                }
+                _ => true,
+            }
+    }
+
+    /// Top-to-bottom, then left-to-right. Rows are compared by vertical
+    /// centre: the play button is 6 DIP taller than its neighbours, so a raw
+    /// `top` comparison put it before Shuffle in the player bar.
+    fn focus_layout_order(&self, left: Target, right: Target) -> std::cmp::Ordering {
+        let a = self.target_rect(left);
+        let b = self.target_rect(right);
+        let a_center = a.top + a.height() * 0.5;
+        let b_center = b.top + b.height() * 0.5;
+        a_center
+            .total_cmp(&b_center)
+            .then_with(|| a.left.total_cmp(&b.left))
     }
 
     pub fn sidebar_max_scroll(&self) -> f32 {
@@ -8722,25 +8896,60 @@ impl App {
         self.keyboard_focus
     }
 
+    /// A player-bar slider is in explicit edit mode (solid accent frame).
+    pub fn adjusting_active(&self) -> bool {
+        self.adjusting.is_some()
+    }
+
     /// First gamepad "A" press when no ring is visible. Landing on the first
-    /// sidebar entry would activate a page switch; the play button (or the
-    /// first settings row) is what a controller-only user is reaching for.
+    /// sidebar entry would activate a page switch; a list page focuses its
+    /// first visible row, the settings page its first row, everything else the
+    /// play button.
     pub fn reveal_gamepad_focus(&mut self, hwnd: HWND) {
         if self.keyboard_focus.is_some() {
             return;
         }
         let target = if self.page == Page::Settings && self.settings_tab != SettingsTab::Library {
             Target::SettingsRow(0)
+        } else if self.page_shows_rows() && self.row_count() > 0 {
+            // Only pages that actually draw the virtual list may focus a row.
+            // Now Playing still has a queue behind it; focusing `Row(0)` there
+            // drew a ring over a nonexistent row.
+            let (first, last) = self.visible_rows();
+            if first < last {
+                Target::Row(first)
+            } else {
+                Target::Play
+            }
         } else {
             Target::Play
         };
         self.focus_target(hwnd, target);
     }
 
+    /// Pages whose content is the virtual row list. Shared by the Tab order and
+    /// the gamepad reveal so both agree on where rows exist.
+    fn page_shows_rows(&self) -> bool {
+        matches!(
+            self.page,
+            Page::Queue
+                | Page::Library
+                | Page::Folders
+                | Page::Search
+                | Page::Discover
+                | Page::Smart
+                | Page::Duplicates
+                | Page::Downloads
+        )
+    }
+
     /// Move the focus ring without activating. Used by UIA SetFocus.
     pub(crate) fn focus_target(&mut self, hwnd: HWND, target: Target) {
         if self.keyboard_focus == Some(target) {
             return;
+        }
+        if self.adjusting.is_some_and(|editing| editing != target) {
+            self.adjusting = None;
         }
         if let Some(old) = self.keyboard_focus {
             self.invalidate(hwnd, self.target_rect(old));
@@ -8811,32 +9020,95 @@ impl App {
             self.move_focus(hwnd, !shift);
             return;
         }
-        // A focused slider takes the arrow keys before the page-level
-        // scroll/seek shortcuts do.
-        if let Some(focus) = self.keyboard_focus {
+        // On the settings page PageUp/PageDown change category (wrapping),
+        // matching the gamepad LT/RT mapping. Long categories still scroll
+        // with the wheel, the scrollbar and Up/Down on the focused row.
+        if self.page == Page::Settings && matches!(virtual_key, 0x21 | 0x22) {
+            let tabs = SettingsTab::ALL;
+            let current = tabs
+                .iter()
+                .position(|tab| *tab == self.settings_tab)
+                .unwrap_or(0);
+            let delta = if virtual_key == 0x21 { -1 } else { 1 };
+            let next = (current as i32 + delta).rem_euclid(tabs.len() as i32) as usize;
+            self.set_settings_tab(hwnd, tabs[next]);
+            return;
+        }
+        let step = self.core.settings.playback.seek_step_secs as f32;
+        // The player-bar sliders use an explicit edit mode, like the native
+        // text inputs: A/Enter/Space enters, B/Esc/Backspace leaves. Without
+        // it the arrows only move the focus ring, so the status bar cannot
+        // trap directional navigation.
+        if let (Some(editing), Some(focus)) = (self.adjusting, self.keyboard_focus)
+            && editing == focus
+        {
+            if matches!(virtual_key, 0x1B | 0x08) {
+                self.adjusting = None;
+                self.invalidate(hwnd, self.target_rect(focus));
+                return;
+            }
             match focus {
-                Target::Volume => {
-                    if matches!(virtual_key, 0x25 | 0x28) {
+                Target::Volume => match virtual_key {
+                    0x25 | 0x28 => {
                         self.change_volume(hwnd, -0.05);
                         return;
                     }
-                    if matches!(virtual_key, 0x27 | 0x26) {
+                    0x27 | 0x26 => {
                         self.change_volume(hwnd, 0.05);
                         return;
                     }
-                }
-                Target::Progress => {
-                    if virtual_key == 0x25 {
-                        self.seek_by(hwnd, -(self.core.settings.playback.seek_step_secs as f32));
+                    0x24 => {
+                        self.set_volume(0.0);
+                        self.invalidate(hwnd, self.layout.volume_hit);
                         return;
                     }
-                    if virtual_key == 0x27 {
-                        self.seek_by(hwnd, self.core.settings.playback.seek_step_secs as f32);
+                    0x23 => {
+                        self.set_volume(1.0);
+                        self.invalidate(hwnd, self.layout.volume_hit);
                         return;
                     }
-                }
+                    _ => {}
+                },
+                Target::Progress => match virtual_key {
+                    0x25 => {
+                        self.seek_by(hwnd, -step);
+                        return;
+                    }
+                    0x27 => {
+                        self.seek_by(hwnd, step);
+                        return;
+                    }
+                    // Vertical arrows do nothing while seeking; leaving is
+                    // B/Esc/Backspace so a slip cannot move the ring.
+                    0x26 | 0x28 => return,
+                    0x24 => {
+                        self.seek_to_secs(hwnd, 0.0);
+                        return;
+                    }
+                    0x23 => {
+                        self.seek_to_secs(hwnd, self.duration() as f64);
+                        return;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
+            if matches!(virtual_key, 0x0D | 0x20) {
+                return;
+            }
+        }
+        // Enter/Space (gamepad A) on a player-bar slider enters edit mode.
+        if matches!(virtual_key, 0x0D | 0x20)
+            && matches!(
+                self.keyboard_focus,
+                Some(Target::Volume) | Some(Target::Progress)
+            )
+        {
+            self.adjusting = self.keyboard_focus;
+            if let Some(target) = self.keyboard_focus {
+                self.invalidate(hwnd, self.target_rect(target));
+            }
+            return;
         }
         // Settings rows use direct activation (so Choice cycles instead of
         // selecting the middle segment), while rows behave like a click.
@@ -8849,6 +9121,11 @@ impl App {
                         let count = self.settings_tab.fields().len() as i32;
                         if (0..count).contains(&next) {
                             self.focus_target(hwnd, Target::SettingsRow(next as usize));
+                        } else {
+                            // Leaving the row list at the top/bottom continues
+                            // through the rest of the accessibility targets
+                            // instead of trapping focus on the settings page.
+                            self.move_focus(hwnd, delta > 0);
                         }
                         return;
                     }
@@ -8925,33 +9202,9 @@ impl App {
                 _ => {}
             }
         }
-        // Home/End on the focused sliders.
-        if let Some(focus) = self.keyboard_focus {
-            match (focus, virtual_key) {
-                (Target::Volume, 0x24) => {
-                    self.set_volume(0.0);
-                    self.invalidate(hwnd, self.layout.volume_hit);
-                    return;
-                }
-                (Target::Volume, 0x23) => {
-                    self.set_volume(1.0);
-                    self.invalidate(hwnd, self.layout.volume_hit);
-                    return;
-                }
-                (Target::Progress, 0x24) => {
-                    self.seek_to_secs(hwnd, 0.0);
-                    return;
-                }
-                (Target::Progress, 0x23) => {
-                    self.seek_to_secs(hwnd, self.duration() as f64);
-                    return;
-                }
-                _ => {}
-            }
-        }
         // Enter/Space activates the focused control, exactly like a real click
-        // (including dialogs and native pickers). Sliders only respond to the
-        // arrow keys above; clicking their center would jump the value.
+        // (including dialogs and native pickers). Sliders were handled above
+        // (they enter edit mode instead of jumping to the click position).
         if self.keyboard_focus.is_some() && matches!(virtual_key, 0x0D | 0x20) {
             if matches!(
                 self.keyboard_focus,
@@ -9007,7 +9260,22 @@ impl App {
                 _ => {}
             }
         }
-        let step = self.core.settings.playback.seek_step_secs as f32;
+        // With a focus ring visible, arrow keys walk the accessibility targets
+        // unless the focused control is in its edit mode (sliders above) or
+        // already consumes that direction (rows/settings rows).
+        if self.keyboard_focus.is_some() {
+            match virtual_key {
+                0x25 | 0x26 => {
+                    self.move_focus(hwnd, false);
+                    return;
+                }
+                0x27 | 0x28 => {
+                    self.move_focus(hwnd, true);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.page == Page::Folders && virtual_key == 0x08 {
             // Backspace: parent directory.
             self.core.handle(Command::BrowseUp);
@@ -9052,6 +9320,7 @@ impl App {
         self.page = page;
         // The focus ring belongs to the old page's controls.
         self.keyboard_focus = None;
+        self.adjusting = None;
         // Capture rows live on the settings page; leaving it cancels them.
         self.shortcut_capture = None;
         self.gamepad_capture = None;

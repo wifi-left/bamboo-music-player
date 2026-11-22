@@ -620,15 +620,20 @@ impl Renderer {
         }
 
         let footer = settings.show_footer.then(|| {
+            let (first, second) = if settings.info_order == 1 {
+                (&state.artist, &state.title)
+            } else {
+                (&state.title, &state.artist)
+            };
             let mut text = String::new();
-            if !state.title.is_empty() {
-                text.push_str(&state.title);
+            if !first.is_empty() {
+                text.push_str(first);
             }
-            if !state.artist.is_empty() {
+            if !second.is_empty() {
                 if !text.is_empty() {
                     text.push_str(" - ");
                 }
-                text.push_str(&state.artist);
+                text.push_str(second);
             }
             text
         });

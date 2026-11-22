@@ -92,6 +92,7 @@ windows = { version = "0.62.2", features = [
     "Storage_Streams",
     "Graphics_Imaging",
     "UI_Notifications",
+    "UI_ViewManagement_Core",
     "Data_Xml_Dom",
 ] }
 

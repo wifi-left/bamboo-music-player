@@ -51,7 +51,25 @@ Bamboo Music Player — Windows 原生音乐播放器，主窗口使用 Win32 + 
   `EDIT` 时处理；手柄同理分为窗口聚焦时的界面导航与失焦后的全局组合键。
 - 手柄界面导航复用 `on_key`（合成方向键/Tab/Enter/Esc），焦点变化走
   `accessibility::notify_focus`；窗口聚焦时 A/B/LB/RB/Start/D-Pad 归界面，
-  包含这些键的全局组合被遮蔽，避免同一次按键触发两个动作。
+  包含这些键的全局组合被遮蔽，避免同一次按键触发两个动作。手柄全局快捷键
+  （`shortcuts.gamepad`）与无障碍导航（`shortcuts.gamepad_ui`）是两个独立开关。
+- 焦点顺序按视觉布局：侧栏自上而下、页面内容自上而下/从左到右、播放条最后；
+  设置页手柄 LT/RT 或键盘 PageUp/PageDown 切换设置分类（切分类会清空焦点环）。
+  设置行到达首/尾后 `move_focus` 继续到相邻目标，不得困在设置页。设置→曲库
+  的开关/查重/扩展名/添加目录/移除目录都是独立焦点目标（`Target::SettingToggle`、
+  `SettingDedupeOption`、`SettingAddFolder`、`FolderRemove`、`Input`）。
+  页面上没有列表时不得把焦点设成不可见的 `Row`（`reveal_gamepad_focus` 用
+  `page_shows_rows` 判断）。
+- 有焦点环时方向键在无障碍控件间移动焦点（列表行/设置行保留上下移动）；
+  播放条音量/进度需要 Enter/Space/手柄 A 进入编辑模式（`App::adjusting`，
+  实线强调框）后方向键才调整/快进，B/Esc/Backspace 退出；无焦点环时保留旧的
+  ←/→ 快进、↑/↓ 滚动。
+- 搜索框、队列筛选、文件夹地址栏、扩展名输入框和设置文本行都进入焦点环
+  （`Target::Input`）。手柄按 A 确认文本输入后弹出 Windows 手柄键盘
+  （`CoreInputView::TryShowWithKind(Gamepad)`；旧系统回退 `ITipInvocation`
+  触控键盘 / osk.exe）。EDIT 获得焦点后手柄输入交给系统键盘，播放器不再响应
+  同一批按键；A 重新打开被关闭的键盘，B/Esc 取消输入并回到焦点环。只有确认后
+  EDIT 才获得焦点并接受输入。
 - 其他程序全屏（游戏）时只响应多键手柄组合，单键绑定忽略
   （`shortcuts.gamepad_fullscreen_only_chords`）；单键与组合同时匹配时组合优先，
   这样默认单键不会和用户自定义组合重复触发。

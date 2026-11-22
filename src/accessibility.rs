@@ -21,6 +21,7 @@ use windows::Win32::UI::Accessibility::{
     NavigateDirection_LastChild, NavigateDirection_NextSibling, NavigateDirection_Parent,
     NavigateDirection_PreviousSibling, ProviderOptions, ProviderOptions_ServerSideProvider,
     UIA_AutomationFocusChangedEventId, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+    UIA_EditControlTypeId,
     UIA_InvokePatternId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
     UIA_IsOffscreenPropertyId, UIA_NamePropertyId, UIA_RangeValuePatternId,
     UIA_SliderControlTypeId, UIA_TextControlTypeId, UIA_ValueValuePropertyId,
@@ -58,6 +59,8 @@ pub enum UiType {
     Button,
     Slider,
     Text,
+    /// Native text input; invokable so screen readers can enter edit mode.
+    Edit,
 }
 
 /// One element published by an overlay window. Coordinates are screen pixels;
@@ -283,6 +286,9 @@ fn build_tree(hwnd: HWND) -> Arc<Tree> {
             slider,
             kind: if slider.is_some() {
                 UiType::Slider
+            } else if matches!(target, Target::Input(_)) {
+                // Announced as an edit field rather than a button.
+                UiType::Edit
             } else {
                 UiType::Button
             },
@@ -312,7 +318,7 @@ fn build_tree(hwnd: HWND) -> Arc<Tree> {
 fn control_name(app: &crate::app::App, target: Target) -> String {
     let snapshot = app.core.snapshot();
     let page = |index: usize| Page::ALL.get(index).map(|page| page.label()).unwrap_or("");
-    match target {
+    let name = match target {
         Target::Nav(index) => crate::i18n::format_template("页面：{}", &[&page(index)]),
         Target::Shuffle => crate::i18n::format_template(
             "随机播放：{}",
@@ -394,6 +400,16 @@ fn control_name(app: &crate::app::App, target: Target) -> String {
         Target::LyricsBig => crate::i18n::tr("全屏歌词").to_string(),
         Target::LyricsEdit => crate::i18n::tr("编辑歌词").to_string(),
         Target::LyricsReload => crate::i18n::tr("重新加载歌词").to_string(),
+        Target::Input(input) => match input {
+            crate::ui::Input::Search => match app.page {
+                Page::Queue => crate::i18n::tr("筛选播放队列").to_string(),
+                Page::Search => crate::i18n::tr("搜索在线曲库").to_string(),
+                _ => crate::i18n::tr("搜索曲库").to_string(),
+            },
+            crate::ui::Input::Extensions => crate::i18n::tr("音频扩展名").to_string(),
+            crate::ui::Input::FolderPath => crate::i18n::tr("文件夹路径").to_string(),
+            crate::ui::Input::SettingNumber => crate::i18n::tr("数值输入").to_string(),
+        },
         Target::SettingsRow(index) => app
             .settings_views()
             .get(index)
@@ -406,6 +422,37 @@ fn control_name(app: &crate::app::App, target: Target) -> String {
                 }
             })
             .unwrap_or_default(),
+        Target::SettingToggle(index) => app
+            .settings_rows()
+            .get(index)
+            .map(|(label, value)| {
+                crate::i18n::format_template("{}：{}", &[&crate::i18n::tr(label), value])
+            })
+            .unwrap_or_default(),
+        Target::SettingDedupeOption(index) => {
+            let mode = crate::app::DEDUPE_ORDER
+                .get(index)
+                .copied()
+                .unwrap_or(crate::core::config::DedupeMode::Metadata);
+            crate::i18n::format_template(
+                "查重方式：{}",
+                &[&crate::i18n::tr(crate::app::dedupe_label(mode))],
+            )
+        }
+        Target::SettingAddFolder => crate::i18n::tr("添加音乐目录").to_string(),
+        Target::FolderRemove(row) => {
+            let index = app.settings_folders_scroll() + row;
+            app.settings_folders()
+                .get(index)
+                .map(|path| {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    crate::i18n::format_template("移除目录：{}", &[&name])
+                })
+                .unwrap_or_else(|| crate::i18n::tr("移除目录").to_string())
+        }
         Target::StatsRecent(index) => snapshot
             .statistics
             .and_then(|stats| stats.recently_played.get(index))
@@ -428,6 +475,11 @@ fn control_name(app: &crate::app::App, target: Target) -> String {
             })
             .unwrap_or_default(),
         _ => format!("{target:?}"),
+    };
+    if app.adjusting_active() && matches!(target, Target::Volume | Target::Progress) {
+        crate::i18n::format_template("{}（编辑中）", &[&name])
+    } else {
+        name
     }
 }
 
@@ -663,7 +715,9 @@ impl IRawElementProviderSimple_Impl for ControlProvider_Impl {
             .into();
             return pattern.cast();
         }
-        if control.kind == UiType::Button && patternid == UIA_InvokePatternId {
+        if matches!(control.kind, UiType::Button | UiType::Edit)
+            && patternid == UIA_InvokePatternId
+        {
             let pattern: IInvokeProvider = InvokePattern {
                 hwnd: self.hwnd,
                 packed: control.click,
@@ -690,6 +744,7 @@ impl IRawElementProviderSimple_Impl for ControlProvider_Impl {
                 UiType::Slider => UIA_SliderControlTypeId.0,
                 UiType::Button => UIA_ButtonControlTypeId.0,
                 UiType::Text => UIA_TextControlTypeId.0,
+                UiType::Edit => UIA_EditControlTypeId.0,
             }));
         }
         if id == UIA_IsEnabledPropertyId.0 {

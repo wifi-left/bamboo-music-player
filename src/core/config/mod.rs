@@ -925,6 +925,15 @@ impl Default for LargeLyricsSettings {
     }
 }
 
+/// Order of the title/artist pair in the desktop-lyrics footer.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopInfoOrder {
+    #[default]
+    TitleArtist,
+    ArtistTitle,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DesktopLyricsSettings {
@@ -936,6 +945,8 @@ pub struct DesktopLyricsSettings {
     pub lines: u8,
     pub show_translation: bool,
     pub show_footer: bool,
+    /// Footer order: `title - artist` (default) or `artist - title`.
+    pub info_order: DesktopInfoOrder,
     pub font_family: Option<String>,
     /// Current line font size.
     pub font_size: f32,
@@ -1018,6 +1029,7 @@ impl Default for DesktopLyricsSettings {
             lines: 3,
             show_translation: true,
             show_footer: true,
+            info_order: DesktopInfoOrder::TitleArtist,
             font_family: None,
             font_size: 34.0,
             next_font_size: 26.0,
@@ -1857,6 +1869,8 @@ pub struct Session {
     pub lyrics_window_size: Option<(f32, f32)>,
     /// Remembered position of the windowed standalone lyrics window.
     pub lyrics_window_pos: Option<(f32, f32)>,
+    /// Whether the windowed standalone lyrics window was maximized at exit.
+    pub lyrics_window_maximized: bool,
     /// Display order of the shuffle cycle, stored as stable track keys so the
     /// order survives playlist re-imports and file additions.
     pub shuffle_keys: Vec<String>,
@@ -2144,6 +2158,21 @@ mod tests {
         assert_eq!(restored.window.lyrics_monitor, Some(1));
         assert!(restored.visualizer.enabled);
         assert_eq!(restored.visualizer.mode, VisualizerMode::Bars);
+    }
+
+    #[test]
+    fn desktop_info_order_defaults_to_title_first_and_round_trips() {
+        let settings = DesktopLyricsSettings::default();
+        assert_eq!(settings.info_order, DesktopInfoOrder::TitleArtist);
+        // Files written before the option existed keep the original order.
+        let legacy: DesktopLyricsSettings = serde_json::from_str("{}").expect("legacy settings");
+        assert_eq!(legacy.info_order, DesktopInfoOrder::TitleArtist);
+
+        let mut settings = settings;
+        settings.info_order = DesktopInfoOrder::ArtistTitle;
+        let text = serde_json::to_string(&settings).expect("serialize");
+        let restored: DesktopLyricsSettings = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(restored.info_order, DesktopInfoOrder::ArtistTitle);
     }
 
     #[test]

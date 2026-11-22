@@ -69,6 +69,10 @@ pub enum Target {
     SettingsText(usize),
     /// Settings page scrollbar for the generic rows.
     SettingsScrollbar,
+    /// Always-visible native text input (search box, queue filter, folder
+    /// address bar or the library-tab extensions field). Activating it gives
+    /// the EDIT keyboard focus; the gamepad also opens the touch keyboard.
+    Input(Input),
     /// Now Playing card: play/pause and open-file actions.
     CardPlay,
     CardOpen,

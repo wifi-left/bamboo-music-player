@@ -352,7 +352,41 @@ impl Painter {
             && hits(area, dirty)
         {
             self.focus_ring(hdc, area, scale);
+            if app.adjusting_active() {
+                // Solid accent frame: the slider is in edit mode (A/Enter
+                // entered, B/Esc leaves), so arrows adjust instead of moving.
+                self.edit_frame(hdc, area, scale);
+            }
         }
+    }
+
+    fn edit_frame(&mut self, hdc: HDC, area: Rect, scale: f32) {
+        let thickness = 2.0;
+        let color = self.pal.accent;
+        self.fill(
+            hdc,
+            Rect::new(area.left, area.top, area.right, area.top + thickness),
+            color,
+            scale,
+        );
+        self.fill(
+            hdc,
+            Rect::new(area.left, area.bottom - thickness, area.right, area.bottom),
+            color,
+            scale,
+        );
+        self.fill(
+            hdc,
+            Rect::new(area.left, area.top, area.left + thickness, area.bottom),
+            color,
+            scale,
+        );
+        self.fill(
+            hdc,
+            Rect::new(area.right - thickness, area.top, area.right, area.bottom),
+            color,
+            scale,
+        );
     }
 
     /// Dotted 1 px focus ring drawn in COPY mode.
@@ -946,11 +980,12 @@ impl Painter {
                 if let Some(hint) = app.external_drag_hint() {
                     hint
                 } else if app.queue_filter_text().trim().is_empty() {
-                    if app.queue_shows_shuffle() {
+                    let base = if app.queue_shows_shuffle() {
                         format!("{} 首歌曲 · 乱序播放", app.queue_len())
                     } else {
                         crate::trf!("{} 首歌曲", app.queue_len())
-                    }
+                    };
+                    app.with_position_label(base)
                 } else {
                     let filtered = format!(
                         "{} / {} 首 · 筛选：{}",
@@ -958,16 +993,19 @@ impl Painter {
                         app.queue_len(),
                         app.queue_filter_text()
                     );
-                    if app.queue_shows_shuffle() {
+                    let filtered = if app.queue_shows_shuffle() {
                         format!("{filtered} · 乱序")
                     } else {
                         filtered
-                    }
+                    };
+                    app.with_position_label(filtered)
                 }
             }
             Page::Library => app.library_status(),
             Page::Folders => app.folder_status(),
-            Page::NowPlaying => crate::i18n::tr("歌词可滚动，点击歌词可跳转").to_string(),
+            Page::NowPlaying => {
+                app.with_position_label(crate::i18n::tr("歌词可滚动，点击歌词可跳转").to_string())
+            }
             Page::Search => app.online_status(),
             Page::Discover => app.discover_status(),
             Page::Statistics => app.statistics_status(),

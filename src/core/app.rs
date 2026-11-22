@@ -339,6 +339,8 @@ pub enum Command {
     SetBackgroundMode(crate::config::BackgroundMode),
     /// User-selected main-window background picture (`None` clears it).
     SetBackgroundImage(Option<PathBuf>),
+    /// Desktop lyrics: title/artist order in the footer.
+    SetDesktopInfoOrder(crate::config::DesktopInfoOrder),
     /// Audio visualizer strip on the Now Playing page.
     SetVisualizerEnabled(bool),
     SetVisualizerMode(crate::config::VisualizerMode),
@@ -2121,6 +2123,10 @@ impl AppCore {
             }
             Command::SetLargeLyricsTranslationColor(color) => {
                 self.settings.large_lyrics.translation_color = color;
+                self.settings_dirty = true;
+            }
+            Command::SetDesktopInfoOrder(order) => {
+                self.settings.desktop_lyrics.info_order = order;
                 self.settings_dirty = true;
             }
             Command::SetDesktopLyricsColor(slot, color) => {
@@ -6402,11 +6408,13 @@ impl AppCore {
         &mut self,
         open: bool,
         windowed: bool,
+        maximized: bool,
         pos: Option<(f32, f32)>,
         size: Option<(f32, f32)>,
     ) {
         self.session.lyrics_window = open;
         self.session.lyrics_window_windowed = windowed;
+        self.session.lyrics_window_maximized = maximized;
         if pos.is_some() {
             self.session.lyrics_window_pos = pos;
         }

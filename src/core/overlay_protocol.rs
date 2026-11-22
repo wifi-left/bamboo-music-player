@@ -47,6 +47,8 @@ pub struct OverlaySettings {
     pub lines: u8,
     pub show_translation: bool,
     pub show_footer: bool,
+    /// Footer order: 0 = `title - artist`, 1 = `artist - title`.
+    pub info_order: u8,
     pub font_family: Option<String>,
     pub font_size: f32,
     pub next_font_size: f32,
@@ -119,6 +121,7 @@ impl Default for OverlaySettings {
             lines: 3,
             show_translation: true,
             show_footer: true,
+            info_order: 0,
             font_family: None,
             font_size: 34.0,
             next_font_size: 26.0,

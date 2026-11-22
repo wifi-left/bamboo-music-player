@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::app::App;
-use crate::config::{DesktopBackgroundMode, LyricsAlign, MiniPlayerSettings};
+use crate::config::{DesktopBackgroundMode, DesktopInfoOrder, LyricsAlign, MiniPlayerSettings};
 use crate::core::desktop_overlay;
 use crate::core::mini_overlay;
 use crate::lyrics::Lyrics;
@@ -374,6 +374,10 @@ fn desktop_settings(app: &App) -> OverlaySettings {
         lines: settings.lines.clamp(1, 3),
         show_translation: settings.show_translation,
         show_footer: settings.show_footer,
+        info_order: match settings.info_order {
+            DesktopInfoOrder::TitleArtist => 0,
+            DesktopInfoOrder::ArtistTitle => 1,
+        },
         font_family: settings.font_family.clone(),
         font_size: settings.font_size,
         next_font_size: settings.next_font_size,

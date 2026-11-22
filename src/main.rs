@@ -57,7 +57,9 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
     UpdateWindow,
 };
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
 use windows::Win32::System::Ole::{IDropTarget, OleInitialize, OleUninitialize, RevokeDragDrop};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -97,8 +99,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow,
     DispatchMessageW,
     GWLP_USERDATA, GWLP_WNDPROC, GetClassNameW, GetClientRect, GetCursorPos,
+    GetDesktopWindow,
     GetForegroundWindow,
     GetMessageW, GetParent, GetSystemMetrics,
+    FindWindowW,
     GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId,
     GetWindowTextW,
     HWND_TOPMOST, HMENU, IDC_ARROW, IDYES, IsIconic, IsWindowVisible, IsZoomed, KillTimer,
@@ -126,7 +130,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WM_CTLCOLORLISTBOX, WM_DRAWITEM,
     WM_SETFONT,
 };
-use windows::core::{PCWSTR, PWSTR, w};
+use windows::UI::ViewManagement::Core::{CoreInputView, CoreInputViewKind};
+use windows::core::{GUID, PCWSTR, PWSTR, w};
 
 use crate::app::{App, Page};
 use crate::core::library::LibrarySort;
@@ -329,6 +334,9 @@ unsafe extern "system" fn folder_path_proc(
 
 /// Posted by the search EDIT subclass on Enter.
 pub(crate) const WM_APP_SEARCH_GO: u32 = WM_APP + 15;
+/// Posted by an always-visible EDIT on Escape: return focus to the player so
+/// the focus ring takes over again.
+pub(crate) const WM_APP_INPUT_ESCAPE: u32 = WM_APP + 24;
 
 static SEARCH_ORIG_PROC: AtomicIsize = AtomicIsize::new(0);
 
@@ -338,10 +346,19 @@ unsafe extern "system" fn search_edit_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_KEYDOWN && wparam.0 as u16 == VK_RETURN.0 {
+    if message == WM_KEYDOWN {
+        let key = wparam.0 as u16;
         let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
-        let _ = unsafe { PostMessageW(Some(parent), WM_APP_SEARCH_GO, WPARAM(0), LPARAM(0)) };
-        return LRESULT(0);
+        if key == VK_RETURN.0 {
+            let _ =
+                unsafe { PostMessageW(Some(parent), WM_APP_SEARCH_GO, WPARAM(0), LPARAM(0)) };
+            return LRESULT(0);
+        }
+        if key == VK_ESCAPE.0 {
+            let _ =
+                unsafe { PostMessageW(Some(parent), WM_APP_INPUT_ESCAPE, WPARAM(0), LPARAM(0)) };
+            return LRESULT(0);
+        }
     }
     let original = SEARCH_ORIG_PROC.load(Ordering::Relaxed);
     if original == 0 {
@@ -351,8 +368,35 @@ unsafe extern "system" fn search_edit_proc(
     unsafe { CallWindowProcW(procedure, hwnd, message, wparam, lparam) }
 }
 
+static EXTENSIONS_ORIG_PROC: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn extensions_edit_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_KEYDOWN && wparam.0 as u16 == VK_ESCAPE.0 {
+        let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+        let _ = unsafe { PostMessageW(Some(parent), WM_APP_INPUT_ESCAPE, WPARAM(0), LPARAM(0)) };
+        return LRESULT(0);
+    }
+    let original = EXTENSIONS_ORIG_PROC.load(Ordering::Relaxed);
+    if original == 0 {
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+    let procedure: WNDPROC = unsafe { std::mem::transmute(original) };
+    unsafe { CallWindowProcW(procedure, hwnd, message, wparam, lparam) }
+}
+
 /// Posted by the tray/overlay threads to wake the UI thread on demand.
 pub(crate) const WM_APP_WAKE: u32 = WM_APP + 1;
+
+/// The gamepad just activated a text input; the next native EDIT focus opens
+/// the touch keyboard. Kept as a static (not in `State`) because `SetFocus`
+/// sends `EN_SETFOCUS` synchronously while the caller still holds the window
+/// state borrow.
+static GAMEPAD_KEYBOARD_PENDING: AtomicBool = AtomicBool::new(false);
 
 struct State {
     app: App,
@@ -531,6 +575,7 @@ struct DesktopSettingsKey {
     lines: u8,
     translation: bool,
     footer: bool,
+    info_order: u8,
     font_size: f32,
     font_family: Option<String>,
     bold: bool,
@@ -580,6 +625,10 @@ fn desktop_settings_key(app: &App) -> DesktopSettingsKey {
         lines: d.lines.clamp(1, 3),
         translation: d.show_translation,
         footer: d.show_footer,
+        info_order: match d.info_order {
+            crate::config::DesktopInfoOrder::TitleArtist => 0,
+            crate::config::DesktopInfoOrder::ArtistTitle => 1,
+        },
         font_size: d.font_size,
         font_family: d.font_family.clone(),
         bold: d.bold,
@@ -1168,6 +1217,12 @@ fn run() -> windows::core::Result<u8> {
                 folder_path_proc as *const () as isize,
             );
             FOLDER_PATH_ORIG_PROC.store(original, Ordering::Relaxed);
+            let original = SetWindowLongPtrW(
+                edit_extensions,
+                GWLP_WNDPROC,
+                extensions_edit_proc as *const () as isize,
+            );
+            EXTENSIONS_ORIG_PROC.store(original, Ordering::Relaxed);
             // EM_SETCUEBANNER (ignored on systems without comctl32 v6).
             SendMessageW(
                 edit,
@@ -1343,14 +1398,18 @@ fn run() -> windows::core::Result<u8> {
         // Reopen the standalone lyrics window exactly as it was left. Bench
         // and self-test runs never touch the user's session.
         if mode.bench.is_none() && !mode.self_test {
-            let (open, windowed) = state_mut(hwnd)
+            let (open, windowed, maximized) = state_mut(hwnd)
                 .map(|state| {
                     let session = &state.app.core.session;
-                    (session.lyrics_window, session.lyrics_window_windowed)
+                    (
+                        session.lyrics_window,
+                        session.lyrics_window_windowed,
+                        session.lyrics_window_maximized,
+                    )
                 })
-                .unwrap_or((false, true));
+                .unwrap_or((false, true, false));
             if open {
-                open_lyrics_window(hwnd, windowed);
+                open_lyrics_window(hwnd, windowed, maximized);
             }
         }
         if mode.bench.is_none() && !mode.self_test {
@@ -1940,11 +1999,12 @@ fn toggle_lyrics_window(hwnd: HWND) {
     } else {
         // Clicking the button always opens a normal window; F11 switches to
         // borderless fullscreen, and that mode is remembered for restarts.
-        open_lyrics_window(hwnd, true);
+        let maximized = state.app.core.session.lyrics_window_maximized;
+        open_lyrics_window(hwnd, true, maximized);
     }
 }
 
-fn open_lyrics_window(hwnd: HWND, windowed: bool) {
+fn open_lyrics_window(hwnd: HWND, windowed: bool, maximized: bool) {
     let Some(state) = (unsafe { state_mut(hwnd) }) else {
         return;
     };
@@ -1953,17 +2013,18 @@ fn open_lyrics_window(hwnd: HWND, windowed: bool) {
     }
     let pos = state.app.core.session.lyrics_window_pos;
     let size = state.app.core.session.lyrics_window_size;
-    match LyricsWindow::new(hwnd, pos, size, state.app.dpi, windowed) {
+    match LyricsWindow::new(hwnd, pos, size, state.app.dpi, windowed, maximized) {
         Ok(window) => {
             state.lyrics_window = Some(window);
             state.app.lyrics_window_open = true;
-            state.app
+            state
+                .app
                 .core
-                .remember_lyrics_window(true, windowed, None, None);
+                .remember_lyrics_window(true, windowed, maximized, None, None);
             if let Some(window) = state.lyrics_window.as_mut() {
                 window.show(&state.app);
             }
-            info!("standalone lyrics window opened (windowed={windowed})");
+            info!("standalone lyrics window opened (windowed={windowed}, maximized={maximized})");
         }
         Err(err) => warn!("standalone lyrics window unavailable: {err}"),
     }
@@ -1979,13 +2040,15 @@ fn close_lyrics_window(hwnd: HWND) {
     };
     let (pos, size) = window.geometry(state.app.dpi);
     let windowed = window.is_windowed();
+    let maximized = window.is_maximized();
     window.hide();
     state.app.lyrics_window_open = false;
-    state.app
+    state
+        .app
         .core
-        .remember_lyrics_window(false, windowed, pos, size);
+        .remember_lyrics_window(false, windowed, maximized, pos, size);
     state.app.invalidate(hwnd, state.app.layout.lyric_header);
-    info!("standalone lyrics window closed (windowed={windowed})");
+    info!("standalone lyrics window closed (windowed={windowed}, maximized={maximized})");
 }
 
 /// Open (or focus) the native lyrics editor. Must run after the caller's
@@ -2046,12 +2109,14 @@ fn lyrics_window_closed(hwnd: HWND) {    let Some(state) = (unsafe { state_mut(h
     };
     let (pos, size) = window.geometry(state.app.dpi);
     let windowed = window.is_windowed();
+    let maximized = window.is_maximized();
     state.app.lyrics_window_open = false;
-    state.app
+    state
+        .app
         .core
-        .remember_lyrics_window(false, windowed, pos, size);
+        .remember_lyrics_window(false, windowed, maximized, pos, size);
     state.app.invalidate(hwnd, state.app.layout.lyric_header);
-    info!("standalone lyrics window closed by the user");
+    info!("standalone lyrics window closed by the user (maximized={maximized})");
 }
 
 /// Apply the remembered main-window placement (stored in DIPs). Returns
@@ -3018,9 +3083,11 @@ fn sync_shortcuts(state: &mut State, hwnd: HWND) {
 /// window (short taps, responsive focus-ring navigation) and 100 ms otherwise.
 fn sync_gamepad(state: &mut State, hwnd: HWND) {
     // Capture mode must keep polling even while global gamepad shortcuts are
-    // switched off, otherwise a fresh binding could never be recorded.
+    // switched off, otherwise a fresh binding could never be recorded. The
+    // accessibility navigation switch is independent from the global bindings.
+    let shortcuts = &state.app.core.settings.shortcuts;
     let want = state.persist
-        && (state.app.core.settings.shortcuts.gamepad || state.app.gamepad_capture_active())
+        && (shortcuts.gamepad || shortcuts.gamepad_ui || state.app.gamepad_capture_active())
         && state.gamepad.is_connected();
     if !want {
         if state.gamepad_running {
@@ -3077,6 +3144,146 @@ fn perform_gamepad_slot(state: &mut State, hwnd: HWND, slot: GamepadSlot) {
     }
 }
 
+/// Undocumented shell interface Windows itself uses to show the touch
+/// keyboard (`CLSID_UIHostNoLaunch`). Launching `TabTip.exe` on its own is
+/// unreliable on Windows 11: the host may already be running hidden, or the
+/// shell may refuse to surface it for a non-shell caller.
+#[windows::core::interface("37c994e7-432b-4834-a2f7-dce1f13b834b")]
+unsafe trait ITipInvocation: windows::core::IUnknown {
+    /// Named in snake case only to satisfy the lint; the vtable slot is the
+    /// COM `Toggle` method.
+    fn toggle(&self, wnd: HWND) -> windows::core::HRESULT;
+}
+
+const CLSID_UIHOST_NO_LAUNCH: GUID =
+    GUID::from_u128(0x4ce576fa_83dc_4f88_951c_9d0782b4e376);
+
+/// The touch keyboard's top-level window. Windows 10 1709+ hosts the modern
+/// keyboard as a `Windows.UI.Core.CoreWindow` parented to an
+/// `ApplicationFrameWindow` only while shown, while the legacy TabTip host
+/// keeps an `IPTip_Main_Window`. A running-but-hidden host also matches, so
+/// visibility is part of the check: `Toggle` would otherwise hide an
+/// already-open keyboard.
+fn touch_keyboard_visible() -> bool {
+    if let Ok(hwnd) = unsafe { FindWindowW(w!("IPTip_Main_Window"), None) } {
+        if !hwnd.0.is_null() && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            return true;
+        }
+    }
+    if let Ok(core) = unsafe {
+        FindWindowW(
+            w!("Windows.UI.Core.CoreWindow"),
+            w!("Microsoft Text Input Application"),
+        )
+    } {
+        let parent = unsafe { GetParent(core) }.unwrap_or_default();
+        // Hidden keyboards lose their ApplicationFrameWindow parent.
+        if !core.0.is_null() && !parent.0.is_null() && unsafe { IsWindowVisible(core) }.as_bool() {
+            return true;
+        }
+    }
+    false
+}
+
+fn launch_touch_keyboard_process() -> bool {
+    let tabtip =
+        std::path::Path::new(r"C:\Program Files\Common Files\microsoft shared\ink\TabTip.exe");
+    if tabtip.exists() && std::process::Command::new(tabtip).spawn().is_ok() {
+        return true;
+    }
+    std::process::Command::new("osk.exe").spawn().is_ok()
+}
+
+/// Show the Windows touch keyboard for a text input activated with a gamepad,
+/// mirroring what Windows Settings does for touch/gamepad text fields. The
+/// COM toggle is tried first because it asks the shell's input host to show
+/// itself; the process launch is only a fallback for the first-ever use
+/// (`REGDB_E_CLASSNOTREG`). Returns false when no method could be started.
+fn gamepad_keyboard_view() -> Option<CoreInputView> {
+    match CoreInputView::GetForCurrentView() {
+        Ok(view) => Some(view),
+        Err(err) => {
+            info!("CoreInputView unavailable: {err}");
+            None
+        }
+    }
+}
+
+/// Whether the system input keyboard (touch or gamepad layout) is currently
+/// covering the app. `GetCoreInputViewOcclusions` is the documented way; the
+/// window-class probe is only a fallback when there is no input view.
+fn gamepad_keyboard_open() -> bool {
+    if let Some(view) = gamepad_keyboard_view() {
+        if let Ok(occlusions) = view.GetCoreInputViewOcclusions() {
+            return occlusions.Size().map(|count| count > 0).unwrap_or(false);
+        }
+    }
+    touch_keyboard_visible()
+}
+
+/// Show the controller-navigable keyboard. Windows 11 24H2+ exposes the
+/// gamepad layout through `CoreInputView::TryShowWithKind`, the same API the
+/// Xbox handheld guidance uses; older builds and unpackaged desktop apps that
+/// have no current view fall back to the regular touch keyboard.
+fn show_gamepad_keyboard() -> bool {
+    if let Some(view) = gamepad_keyboard_view() {
+        match view.TryShowWithKind(CoreInputViewKind::Gamepad) {
+            Ok(true) => {
+                info!("gamepad keyboard shown");
+                return true;
+            }
+            Ok(false) => info!("gamepad keyboard layout unavailable on this view"),
+            Err(err) => warn!("TryShowWithKind(Gamepad) failed: {err}"),
+        }
+    }
+    show_touch_keyboard()
+}
+
+fn show_touch_keyboard() -> bool {
+    if touch_keyboard_visible() {
+        info!("touch keyboard already visible");
+        return true;
+    }
+    if let Ok(host) = unsafe {
+        CoCreateInstance::<_, ITipInvocation>(&CLSID_UIHOST_NO_LAUNCH, None, CLSCTX_ALL)
+    } {
+        let result = unsafe { host.toggle(GetDesktopWindow()) };
+        if result.is_ok() {
+            info!("touch keyboard shown via ITipInvocation");
+            return true;
+        }
+        warn!("ITipInvocation.Toggle failed: 0x{:08X}", result.0 as u32);
+    } else {
+        warn!("UIHostNoLaunch is not registered (touch keyboard never started?)");
+    }
+    let launched = launch_touch_keyboard_process();
+    info!("touch keyboard process launch: {launched}");
+    launched
+}
+
+/// Close the system keyboard when the user leaves the text input.
+fn hide_gamepad_keyboard() {
+    if let Some(view) = gamepad_keyboard_view() {
+        match view.TryHide() {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => warn!("TryHide failed: {err}"),
+        }
+    }
+    if touch_keyboard_visible() {
+        toggle_touch_keyboard();
+    }
+}
+
+fn toggle_touch_keyboard() -> bool {
+    if let Ok(host) = unsafe {
+        CoCreateInstance::<_, ITipInvocation>(&CLSID_UIHOST_NO_LAUNCH, None, CLSCTX_ALL)
+    } {
+        return unsafe { host.toggle(GetDesktopWindow()) }.is_ok();
+    }
+    false
+}
+
 /// Parsed global gamepad bindings, in `GamepadSlot::ALL` order. An empty
 /// string means the action has no gamepad binding.
 fn gamepad_bindings(settings: &crate::config::ShortcutSettings) -> Vec<(GamepadSlot, u32)> {
@@ -3111,6 +3318,14 @@ fn ui_has_focus(hwnd: HWND) -> bool {
     // thread keyboard state; posted keys from the lyrics window are covered by
     // the process check above.
     !unsafe { GetFocus() }.0.is_null()
+}
+
+/// True when the player's main window is the active top-level window. Gamepad
+/// UI navigation is limited to this window: the standalone lyrics window and
+/// the lyrics editor have their own focus, so driving the invisible main-window
+/// ring behind them would only hijack their focus.
+fn player_has_foreground(hwnd: HWND) -> bool {
+    (unsafe { GetForegroundWindow() }) == hwnd
 }
 
 /// A native text editor owns the keyboard. In-window shortcuts must not seek
@@ -5330,10 +5545,14 @@ unsafe extern "system" fn window_proc(
                     let mut connected = true;
                     let mut focus_changed = false;
                     let mut capture_finished = false;
+                    let mut leave_input = false;
                     if let Some(state) = unsafe { state_mut(hwnd) } {
                         let tick = state.gamepad.poll();
                         connected = state.gamepad.is_connected();
                         if let Some(tick) = tick {
+                            if tick.pressed != 0 || tick.direction.is_some() {
+                                state.last_input = Instant::now();
+                            }
                             if state.app.gamepad_capture_active() {
                                 // Accumulate until every button is released;
                                 // the longest chord held is the binding.
@@ -5344,95 +5563,209 @@ unsafe extern "system" fn window_proc(
                                     changed = true;
                                 }
                             } else {
-                                let focused;
-                                let fired;
-                                {
-                                    let shortcuts = &state.app.core.settings.shortcuts;
-                                    focused = shortcuts.gamepad_ui
-                                        && ui_has_focus(hwnd)
-                                        && !text_input_has_focus();
-                                    let bindings = gamepad_bindings(shortcuts);
-                                    let masks: Vec<u32> =
-                                        bindings.iter().map(|(_, mask)| *mask).collect();
-                                    let mut fired_slots: Vec<GamepadSlot> = Vec::new();
-                                    // Probed lazily: a DWM query per 100 ms tick
-                                    // would be wasted when no single-button
-                                    // binding is pressed.
-                                    let mut fullscreen = None;
-                                    for index in crate::gamepad::triggered(
-                                        tick.previous,
-                                        tick.down,
-                                        &masks,
-                                    ) {
-                                        let mask = masks[index];
-                                        // While the focus ring is active its
-                                        // buttons belong to navigation, exactly
-                                        // like an in-window keyboard shortcut.
-                                        if focused && mask & UI_MASK != 0 {
-                                            continue;
-                                        }
-                                        if shortcuts.gamepad_fullscreen_only_chords
-                                            && !focused
-                                            && !crate::gamepad::is_chord(mask)
-                                            && *fullscreen
-                                                .get_or_insert_with(other_app_fullscreen)
-                                        {
-                                            // A game owns the monitor; a single
-                                            // button is gameplay, not a media key.
-                                            continue;
-                                        }
-                                        fired_slots.push(bindings[index].0);
-                                    }
-                                    fired = fired_slots;
+                                if tick.pressed != 0 {
+                                    // A pending touch-keyboard request only
+                                    // belongs to the press that created it.
+                                    GAMEPAD_KEYBOARD_PENDING.store(false, Ordering::Relaxed);
                                 }
-                                if focused {
+                                if player_has_foreground(hwnd) && text_input_has_focus() {
+                                    // The EDIT owns normal typing, so the rest
+                                    // of the controller belongs to the system
+                                    // keyboard. A re-opens the keyboard after
+                                    // it was dismissed; B leaves input mode.
                                     if tick.pressed & crate::gamepad::A != 0 {
-                                        // The first press only reveals the ring;
-                                        // the next one activates the control.
-                                        let before = state.app.keyboard_focus();
-                                        if before.is_none() {
-                                            state.app.reveal_gamepad_focus(hwnd);
-                                        } else {
-                                            state.app.on_key(hwnd, 0x0D, false, false);
+                                        // Only re-open after the keyboard was
+                                        // dismissed; while it is visible the
+                                        // A press belongs to the selected key.
+                                        if !gamepad_keyboard_open()
+                                            && !show_gamepad_keyboard()
+                                        {
+                                            state.app.push_toast(
+                                                hwnd,
+                                                crate::i18n::tr("无法打开手柄键盘").to_string(),
+                                                true,
+                                            );
                                         }
-                                        focus_changed |= state.app.keyboard_focus() != before;
                                         changed = true;
                                     }
                                     if tick.pressed & crate::gamepad::B != 0 {
-                                        let before = state.app.keyboard_focus();
-                                        state.app.on_key(hwnd, 0x1B, false, false);
-                                        focus_changed |= state.app.keyboard_focus() != before;
+                                        leave_input = true;
                                         changed = true;
                                     }
-                                    if tick.pressed & crate::gamepad::LB != 0 {
-                                        let before = state.app.keyboard_focus();
-                                        state.app.on_key(hwnd, 0x09, false, true);
-                                        focus_changed |= state.app.keyboard_focus() != before;
+                                } else {
+                                    let focused;
+                                    let fired;
+                                    let settings_page;
+                                    {
+                                        let shortcuts = &state.app.core.settings.shortcuts;
+                                        focused = shortcuts.gamepad_ui
+                                            && player_has_foreground(hwnd);
+                                        settings_page =
+                                            state.app.page == crate::app::Page::Settings;
+                                        // The global bindings switch is
+                                        // independent from the accessibility
+                                        // navigation switch.
+                                        let bindings = if shortcuts.gamepad {
+                                            gamepad_bindings(shortcuts)
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        let masks: Vec<u32> =
+                                            bindings.iter().map(|(_, mask)| *mask).collect();
+                                        let mut fired_slots: Vec<GamepadSlot> = Vec::new();
+                                        // Probed lazily: a DWM query per tick
+                                        // would be wasted when no single-button
+                                        // binding is pressed.
+                                        let mut fullscreen = None;
+                                        for index in crate::gamepad::triggered(
+                                            tick.previous,
+                                            tick.down,
+                                            &masks,
+                                        ) {
+                                            let mask = masks[index];
+                                            // While the focus ring is active its
+                                            // buttons belong to navigation, like
+                                            // in-window keyboard shortcuts. On the
+                                            // settings page LT/RT switch tabs, so
+                                            // those chords are shadowed too.
+                                            if focused
+                                                && (mask & UI_MASK != 0
+                                                    || (settings_page
+                                                        && mask
+                                                            & (crate::gamepad::LT
+                                                                | crate::gamepad::RT)
+                                                            != 0))
+                                            {
+                                                continue;
+                                            }
+                                            if shortcuts.gamepad_fullscreen_only_chords
+                                                && !focused
+                                                && !crate::gamepad::is_chord(mask)
+                                                && *fullscreen
+                                                    .get_or_insert_with(other_app_fullscreen)
+                                            {
+                                                // A game owns the monitor; a
+                                                // single button is gameplay,
+                                                // not a media key.
+                                                continue;
+                                            }
+                                            fired_slots.push(bindings[index].0);
+                                        }
+                                        fired = fired_slots;
+                                    }
+                                    if focused {
+                                        if settings_page
+                                            && tick.pressed
+                                                & (crate::gamepad::LT | crate::gamepad::RT)
+                                                != 0
+                                        {
+                                            // LT/RT flip the settings categories
+                                            // (wrapping), like PageUp/PageDown.
+                                            let tabs = crate::app::SettingsTab::ALL;
+                                            let current = tabs
+                                                .iter()
+                                                .position(|tab| *tab == state.app.settings_tab)
+                                                .unwrap_or(0);
+                                            let next =
+                                                if tick.pressed & crate::gamepad::LT != 0 {
+                                                    (current + tabs.len() - 1) % tabs.len()
+                                                } else {
+                                                    (current + 1) % tabs.len()
+                                                };
+                                            state.app.set_settings_tab(hwnd, tabs[next]);
+                                            changed = true;
+                                        }
+                                        if tick.pressed & crate::gamepad::A != 0 {
+                                            // The first press reveals the ring;
+                                            // the next one activates the control
+                                            // (or enters slider edit mode).
+                                            let before = state.app.keyboard_focus();
+                                            let adjusting_before =
+                                                state.app.adjusting_active();
+                                            match before {
+                                                None => state.app.reveal_gamepad_focus(hwnd),
+                                                Some(target) => {
+                                                    if state
+                                                        .app
+                                                        .target_opens_text_input(target)
+                                                    {
+                                                        GAMEPAD_KEYBOARD_PENDING
+                                                            .store(true, Ordering::Relaxed);
+                                                    }
+                                                    state.app.on_key(hwnd, 0x0D, false, false);
+                                                }
+                                            }
+                                            focus_changed |= state.app.keyboard_focus()
+                                                != before
+                                                || state.app.adjusting_active()
+                                                    != adjusting_before;
+                                            changed = true;
+                                        }
+                                        if tick.pressed & crate::gamepad::B != 0 {
+                                            if state.app.sort_menu_open {
+                                                // B closes the native sort list
+                                                // before anything else, like Esc.
+                                                state.app.set_sort_menu_open(hwnd, false);
+                                                sync_edit_boxes(state, hwnd);
+                                            } else {
+                                                let before = state.app.keyboard_focus();
+                                                state.app.on_key(hwnd, 0x1B, false, false);
+                                                focus_changed |=
+                                                    state.app.keyboard_focus() != before;
+                                            }
+                                            changed = true;
+                                        }
+                                        if tick.pressed & crate::gamepad::LB != 0 {
+                                            let before = state.app.keyboard_focus();
+                                            state.app.on_key(hwnd, 0x09, false, true);
+                                            focus_changed |=
+                                                state.app.keyboard_focus() != before;
+                                            changed = true;
+                                        }
+                                        if tick.pressed & crate::gamepad::RB != 0 {
+                                            let before = state.app.keyboard_focus();
+                                            state.app.on_key(hwnd, 0x09, false, false);
+                                            focus_changed |=
+                                                state.app.keyboard_focus() != before;
+                                            changed = true;
+                                        }
+                                        if tick.pressed & crate::gamepad::START != 0 {
+                                            state.app.toggle_play(hwnd);
+                                            changed = true;
+                                        }
+                                        if let Some(direction) = tick.direction {
+                                            // No ring yet: show where navigation
+                                            // starts. With a ring, the keys walk
+                                            // the accessibility targets.
+                                            let before = state.app.keyboard_focus();
+                                            if before.is_none() {
+                                                state.app.reveal_gamepad_focus(hwnd);
+                                            } else {
+                                                state
+                                                    .app
+                                                    .on_key(hwnd, direction.key(), false, false);
+                                            }
+                                            focus_changed |=
+                                                state.app.keyboard_focus() != before;
+                                            changed = true;
+                                        }
+                                    }
+                                    for slot in fired {
+                                        perform_gamepad_slot(state, hwnd, slot);
                                         changed = true;
                                     }
-                                    if tick.pressed & crate::gamepad::RB != 0 {
-                                        let before = state.app.keyboard_focus();
-                                        state.app.on_key(hwnd, 0x09, false, false);
-                                        focus_changed |= state.app.keyboard_focus() != before;
-                                        changed = true;
-                                    }
-                                    if tick.pressed & crate::gamepad::START != 0 {
-                                        state.app.toggle_play(hwnd);
-                                        changed = true;
-                                    }
-                                    if let Some(direction) = tick.direction {
-                                        let before = state.app.keyboard_focus();
-                                        state.app.on_key(hwnd, direction.key(), false, false);
-                                        focus_changed |= state.app.keyboard_focus() != before;
-                                        changed = true;
-                                    }
-                                }
-                                for slot in fired {
-                                    perform_gamepad_slot(state, hwnd, slot);
-                                    changed = true;
                                 }
                             }
                         }
+                    }
+                    if leave_input {
+                        // B in an input: close the system keyboard and hand
+                        // the focus back to the player. `SetFocus` sends
+                        // EN_KILLFOCUS synchronously, so run it after the
+                        // `State` borrow above ended.
+                        GAMEPAD_KEYBOARD_PENDING.store(false, Ordering::Relaxed);
+                        hide_gamepad_keyboard();
+                        let _ = unsafe { SetFocus(Some(hwnd)) };
                     }
                     if !connected {
                         let _ = unsafe { KillTimer(Some(hwnd), GAMEPAD_TIMER) };
@@ -5497,6 +5830,25 @@ unsafe extern "system" fn window_proc(
                 sync_inline_edits(state, hwnd);
                 sync_overlays(state, hwnd);
                 sync_system(state, hwnd);
+            }
+            // The focus ring activated an always-visible input box: move the
+            // keyboard focus to the native EDIT after the click handler (and
+            // its `State` borrow) finished.
+            let input_edit = unsafe { state_mut(hwnd) }.and_then(|state| {
+                state
+                    .app
+                    .take_input_focus_request()
+                    .map(|input| match input {
+                        crate::ui::Input::Search => state.edit,
+                        crate::ui::Input::Extensions => state.edit_extensions,
+                        crate::ui::Input::FolderPath => state.edit_folder,
+                        crate::ui::Input::SettingNumber => state.edit_number,
+                    })
+            });
+            if let Some(edit) = input_edit {
+                if !edit.0.is_null() {
+                    let _ = unsafe { SetFocus(Some(edit)) };
+                }
             }
             // Frame-rate changes restart the animation timer immediately.
             unsafe { sync_timer(hwnd) };
@@ -6104,6 +6456,7 @@ unsafe extern "system" fn window_proc(
                     // only run while this player owns the foreground and never
                     // while a native text editor is typing.
                     let focus_before = state.app.keyboard_focus();
+                    let adjusting_before = state.app.adjusting_active();
                     let ctrl = unsafe { GetKeyState(0x11) } < 0; // VK_CONTROL
                     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
                     if key == 0x1B && state.app.sort_menu_open {
@@ -6115,7 +6468,8 @@ unsafe extern "system" fn window_proc(
                     }
                     open_files = state.app.take_pick_files();
                     open_editor = state.app.take_lyrics_editor();
-                    focus_changed = state.app.keyboard_focus() != focus_before;
+                    focus_changed = state.app.keyboard_focus() != focus_before
+                        || state.app.adjusting_active() != adjusting_before;
                     focus_after = state.app.keyboard_focus();
                     sync_lyrics(state, hwnd);
                     sync_panel(state, hwnd);
@@ -6223,6 +6577,14 @@ unsafe extern "system" fn window_proc(
                 sync_edit_boxes(state, hwnd);
                 unsafe { sync_timer(hwnd) };
             }
+            LRESULT(0)
+        }
+        WM_APP_INPUT_ESCAPE => {
+            // Escape in an always-visible input closes the system keyboard and
+            // returns to the focus ring.
+            GAMEPAD_KEYBOARD_PENDING.store(false, Ordering::Relaxed);
+            hide_gamepad_keyboard();
+            let _ = unsafe { SetFocus(Some(hwnd)) };
             LRESULT(0)
         }
         WM_APP_FOLDER_GO => {
@@ -6806,6 +7168,18 @@ unsafe extern "system" fn window_proc(
                         None
                     };
                     state.app.set_input_focus(hwnd, focus);
+                    if code == 0x0100 && GAMEPAD_KEYBOARD_PENDING.swap(false, Ordering::Relaxed) {
+                        // The gamepad activated a text input: open the Windows
+                        // touch keyboard, like Settings does for touch fields.
+                        info!("gamepad text input focused: opening touch keyboard");
+                        if !show_gamepad_keyboard() {
+                            state.app.push_toast(
+                                hwnd,
+                                crate::i18n::tr("无法打开手柄键盘").to_string(),
+                                true,
+                            );
+                        }
+                    }
                 }
             }
             if code == EN_CHANGE {

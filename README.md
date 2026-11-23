@@ -24,6 +24,19 @@ Windows 原生音乐播放器。主窗口使用 Win32 + GDI 自绘，Direct2D �
 `--sort <title|artist|album|added|duration|plays|played|path>`、`--folder <dir>`、
 `--settings-tab 0..14`、`--theme <dark|light|system>`。
 
+## 子模块
+
+原生 UI 框架在独立仓库
+[`bamboo-rust-native-ui`](https://github.com/wifi-left/bamboo-rust-native-ui)，
+以子模块 `native-ui/` 挂在本仓库下。首次克隆请用：
+
+```powershell
+git clone --recursive https://github.com/wifi-left/bamboo-music-player.git
+```
+
+已有克隆更新后执行 `git submodule update --init --recursive`，否则
+`native-ui/` 为空，引用该框架的构建步骤会失败。
+
 ## 功能
 
 ### 播放

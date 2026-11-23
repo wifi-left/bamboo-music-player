@@ -1,0 +1,3 @@
+[submodule "native-ui"]
+	path = native-ui
+	url = https://github.com/wifi-left/bamboo-rust-native-ui.git

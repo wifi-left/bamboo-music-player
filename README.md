@@ -37,6 +37,9 @@ git clone --recursive https://github.com/wifi-left/bamboo-music-player.git
 已有克隆更新后执行 `git submodule update --init --recursive`，否则
 `native-ui/` 为空，引用该框架的构建步骤会失败。
 
+框架以 **Apache-2.0** 许可发布：允许闭源商用，分发时保留其 `LICENSE` 与
+`NOTICE` 即可，与本项目自身的许可不冲突。
+
 ## 功能
 
 ### 播放
